@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Runtime/private data
+data/
+server/data/
+worker/.local/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+.codex/
+
+# Build outputs
+dist/
+build/
+release/
+.build/
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
