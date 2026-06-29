@@ -32,6 +32,7 @@ Sedna is designed around:
 The current product and architecture checkpoint is here:
 
 - [docs/personal-agent-design-checkpoint.md](docs/personal-agent-design-checkpoint.md)
+- [docs/brain-mvp-design.md](docs/brain-mvp-design.md)
 
 This document is the current source of truth for ongoing design discussion. It is intentionally a checkpoint, not a final implementation spec.
 

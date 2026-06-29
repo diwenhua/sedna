@@ -9,6 +9,7 @@ The project is **Sedna**: a server-first, privacy-first, distributed personal as
 The current source of truth is:
 
 - `docs/personal-agent-design-checkpoint.md`
+- `docs/brain-mvp-design.md`
 
 Do not treat the old Electron app or terminal workbench as the product direction. Those prototypes were intentionally removed.
 

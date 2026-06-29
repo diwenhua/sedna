@@ -32,6 +32,7 @@ Sedna 的设计围绕以下核心展开：
 当前产品和架构检查点在这里：
 
 - [docs/personal-agent-design-checkpoint.md](docs/personal-agent-design-checkpoint.md)
+- [docs/brain-mvp-design.md](docs/brain-mvp-design.md)
 
 这个文档是当前设计讨论的事实来源。它是一个工作检查点，不是最终实现规格。
 
