@@ -49,6 +49,8 @@ When product direction changes, update `docs/personal-agent-design-checkpoint.md
 
 Keep README focused on current project identity and entry points. Do not add implementation instructions for frameworks that have not been chosen.
 
+Keep `README.md` as the default English GitHub entry point. Keep `README.zh-CN.md` as the Simplified Chinese counterpart, and update both when changing repository-level positioning.
+
 ## Implementation Rules
 
 Implementation has not started yet. Before adding code:

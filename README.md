@@ -1,5 +1,7 @@
 # Sedna
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Sedna is a design-stage, single-owner, self-hosted personal assistant agent system.
 
 The project is being rebuilt from a clean direction. The goal is not to create a generic chatbot, SaaS assistant, or Electron desktop wrapper. The goal is to build a reusable open-source framework that each person can deploy as their own private assistant.
