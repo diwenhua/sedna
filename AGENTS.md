@@ -8,9 +8,15 @@ The project is **Sedna**: a server-first, privacy-first, distributed personal as
 
 The current source of truth is:
 
+- `docs/README.md`
 - `docs/personal-agent-design-checkpoint.md`
 - `docs/brain-mvp-design.md`
 - `docs/llm-integration-mvp.md`
+- `docs/dynamic-llm-config-design.md`
+- `docs/agent-runtime-mvp-design.md`
+- `docs/agent-workbench-ui-design.md`
+- `docs/i18n-mvp-design.md`
+- `docs/mcp-and-skills-mvp-design.md`
 
 Do not treat the old Electron app or terminal workbench as the product direction. Those prototypes were intentionally removed.
 
@@ -55,37 +61,44 @@ Keep `README.md` as the default English GitHub entry point. Keep `README.zh-CN.m
 
 ## Implementation Rules
 
-Implementation has not started yet. Before adding code:
+Implementation has started on the Brain MVP foundation. Before adding or changing major code paths:
 
 - confirm the MVP scope
-- choose the backend and Web UI stack
-- define the initial database schema
-- define worker pairing and permission policy behavior
+- check the relevant design document in `docs/`
+- keep Agent Runtime, Tool Registry, LLM provider routing, memory graph, policy, and audit boundaries explicit
 - keep all runtime/private data out of the repository
 
 When code is added, prefer clear module boundaries:
 
 ```text
-server/
+apps/brain/
   agent/
+  llm/
   memory/
   graph/
   policy/
+  tools/
+  mcp/
+  skills/
   workers/
   conversations/
   artifacts/
   audit/
   api/
 
-worker/
+apps/worker/
   runtime/
   capabilities/
   guardrails/
   sync/
 
-web/
+apps/web/
   timeline/
+  agent/
   graph/
+  memory/
+  tasks/
+  settings/
   workers/
   policy/
 ```

@@ -4,7 +4,9 @@ node_modules/
 # Runtime/private data
 data/
 server/data/
+apps/brain/data/
 worker/.local/
+apps/worker/.local/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

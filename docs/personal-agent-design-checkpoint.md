@@ -829,6 +829,52 @@ external write/change/send/delete actions require confirmation
 distributed worker jobs must be scoped, authenticated, audited, and policy-checked
 ```
 
+## Agent Runtime Direction
+
+The assistant should be implemented as an agent runtime, not as a single chat completion plus post-processing.
+
+The runtime should follow a bounded ReAct-style loop:
+
+```text
+owner message
+-> context builder
+-> planner model
+-> action proposal
+-> policy check
+-> action/tool execution
+-> observation
+-> continue or final reply
+```
+
+The LLM can propose actions, but it must not directly mutate canonical memory, tasks, graph state, settings, tools, workers, or credentials. All state changes must pass through structured executors, policy checks, events, and audit records.
+
+The first safe internal actions are memory candidate creation, task creation, task status updates, graph linking, event creation, confirmation requests, resource addition, and note summarization.
+
+The React Web UI should expose this as an Agent Workbench. The owner should see agent runs, steps, action proposals, policy decisions, observations, confirmations, and results without exposing hidden chain-of-thought.
+
+## MCP And Skills Direction
+
+Sedna should support common agent ecosystem extensions through MCP and Skills.
+
+The first version should make Sedna an MCP host/client:
+
+- configure MCP servers
+- discover tools, resources, and prompts
+- register discovered tools in a unified Tool Registry
+- expose only policy-approved tools to the Agent Runtime
+- execute MCP tools through Tool Executor, not direct model access
+- show tool calls, observations, failures, and confirmations in Agent Activity
+
+Skills should be treated as reusable workflows:
+
+```text
+instruction + workflow + required tools + safety policy + examples
+```
+
+The first version can support built-in and local markdown skills. A marketplace, automatic skill evolution, and exposing Sedna itself as an MCP server can come later.
+
+MCP server outputs, tool descriptions, resources, prompts, and annotations are untrusted input. They cannot override Sedna's policy, privacy rules, confirmation requirements, or canonical memory governance.
+
 ## Distributed Execution Safety
 
 Distributed workers increase capability and risk. Safety must be part of the first design.
@@ -1028,8 +1074,11 @@ The UI should be chat-first, with supporting panels for:
 - agent activity: what the assistant automatically learned, changed, merged, expired, or quarantined
 - pending confirmations for high-risk memories or actions
 - worker status, capabilities, recent jobs, and pending worker confirmations
+- settings for interface language, assistant reply language, provider status, and privacy preferences
 
 Electron can remain optional and should not drive the core architecture.
+
+The product should support English and Simplified Chinese from the first Web UI version. UI language, assistant reply language, and memory evidence language should be treated as separate concepts.
 
 ## Memory Graph Visualization
 

@@ -17,7 +17,9 @@ Sedna should be able to:
 - classify memory risk and confidence
 - write events, evidence, candidates, and audit records
 
-The first implementation should support both a real provider and a mock provider.
+The first implementation should support both a real provider and a mock provider. Dynamic provider configuration and model routing are defined in:
+
+- [docs/dynamic-llm-config-design.md](dynamic-llm-config-design.md)
 
 ## Provider Boundary
 
@@ -39,6 +41,7 @@ The provider interface should support:
 
 ```text
 generateAssistantReply(input) -> assistant reply
+planAgentStep(input) -> structured agent step
 extractMemoryCandidates(input) -> structured candidate memories
 ```
 
@@ -62,6 +65,37 @@ OPENAI_MODEL=...
 No API key should be committed. `.env.example` may document required variables.
 
 If no provider is configured, the Brain should default to `mock` in development and tests.
+
+## Reply Language
+
+Assistant reply language is a first-class setting.
+
+The LLM context builder should resolve:
+
+```text
+assistant_reply_locale = follow_ui | en | zh-CN
+ui_locale = en | zh-CN
+```
+
+If `assistant_reply_locale` is `follow_ui`, the Brain should use `ui_locale` as the reply language.
+
+The chat prompt must include an explicit language instruction, for example:
+
+```text
+Reply to the owner in Simplified Chinese unless the owner explicitly asks for another language.
+```
+
+or:
+
+```text
+Reply to the owner in English unless the owner explicitly asks for another language.
+```
+
+Memory extraction should preserve evidence quotes in their original language. Candidate labels may follow the resolved assistant reply language, but raw evidence should not be translated by default.
+
+The UI language and assistant reply language are defined in:
+
+- [docs/i18n-mvp-design.md](i18n-mvp-design.md)
 
 ## Conversation Flow
 

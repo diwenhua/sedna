@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Sedna 是一个处于设计阶段的单用户、自托管私人助理 agent 系统。
+Sedna 是一个单用户、自托管私人助理 agent 系统。
 
 这个项目正在从一个干净的新方向重新开始。它的目标不是做一个通用聊天机器人、SaaS 助理，或者 Electron 桌面壳。它的目标是构建一个可复用的开源框架，让每个人都可以部署属于自己的私人助理。
 
@@ -29,12 +29,19 @@ Sedna 的设计围绕以下核心展开：
 
 ## 设计检查点
 
-当前产品和架构检查点在这里：
+当前产品和架构文档在这里：
 
+- [docs/README.md](docs/README.md)
 - [docs/personal-agent-design-checkpoint.md](docs/personal-agent-design-checkpoint.md)
 - [docs/brain-mvp-design.md](docs/brain-mvp-design.md)
+- [docs/llm-integration-mvp.md](docs/llm-integration-mvp.md)
+- [docs/dynamic-llm-config-design.md](docs/dynamic-llm-config-design.md)
+- [docs/agent-runtime-mvp-design.md](docs/agent-runtime-mvp-design.md)
+- [docs/agent-workbench-ui-design.md](docs/agent-workbench-ui-design.md)
+- [docs/i18n-mvp-design.md](docs/i18n-mvp-design.md)
+- [docs/mcp-and-skills-mvp-design.md](docs/mcp-and-skills-mvp-design.md)
 
-这个文档是当前设计讨论的事实来源。它是一个工作检查点，不是最终实现规格。
+这些文档是当前设计讨论的事实来源。它们是工作检查点，不是最终实现规格。
 
 ## 预期架构
 
@@ -64,9 +71,64 @@ Web UI
 
 ## 仓库状态
 
-这个仓库目前只包含文档。旧的 Electron 原型和终端 agent workbench 已经移除，项目将围绕新的服务端优先、分布式私人 agent 设计重新开始。
+这个仓库现在包含第一版 Sedna Brain MVP 基础实现。旧的 Electron 原型和终端 agent workbench 已经移除，项目将继续围绕新的服务端优先、分布式私人 agent 设计推进。
 
-实现还没有开始。
+当前实现切片：
+
+- TypeScript + pnpm workspace monorepo
+- `apps/brain` 中的中央大脑 API 服务
+- `apps/web` 中的 React + Vite Web UI
+- `apps/worker` 中的 mock-only worker 包
+- `apps/cli` 中的 CLI 骨架
+- `packages/` 下的共享 protocol、memory、policy 和工具包
+- 基于 SQLite 的规范记忆图 schema 和 migration
+- 会话时间线、候选记忆审核、图查询、mock worker 注册和审计查询 API
+- LLM provider 边界，支持 deterministic `mock` 模式和真实 `openai` 模式
+- Agent Runtime 和 React Agent Workbench 是当前 MVP 设计目标
+- 动态 LLM 配置、MCP 和 Skills 是计划中的 MVP 设置能力
+
+## 开发
+
+安装依赖：
+
+```bash
+pnpm install
+```
+
+运行测试和构建：
+
+```bash
+pnpm test
+pnpm build
+```
+
+启动 Brain API：
+
+```bash
+pnpm dev:brain
+```
+
+在另一个终端启动 Web UI：
+
+```bash
+pnpm dev:web
+```
+
+LLM 配置：
+
+```bash
+cp .env.example .env
+```
+
+默认 provider 是 `mock`，不需要密钥，适合测试和离线开发。要使用真实 OpenAI 对话能力，设置：
+
+```text
+LLM_PROVIDER=openai
+OPENAI_API_KEY=your_key_here
+OPENAI_MODEL=gpt-4.1-mini
+```
+
+不要提交 `.env` 或 API key。
 
 ## 隐私和数据
 
@@ -78,7 +140,9 @@ Web UI
 data/
 .env
 server/data/
+apps/brain/data/
 worker/.local/
+apps/worker/.local/
 ```
 
 仓库只应该包含代码、schema、示例配置、测试和文档。
@@ -87,8 +151,6 @@ worker/.local/
 
 主要设计问题仍在整理中：
 
-- 第一版 MVP 范围
-- 后端和 Web UI 技术栈
 - 权限策略模型
 - 产物存储和传输
 - 用户认证和恢复

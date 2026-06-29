@@ -23,6 +23,7 @@ The MVP includes:
 
 - a Central Brain API server
 - a Web UI served as the primary client
+- a graph-native Agent Runtime with safe internal actions
 - SQLite-backed canonical memory graph storage
 - conversation timeline
 - event and audit records
@@ -30,6 +31,8 @@ The MVP includes:
 - Memory Inbox for review
 - simple domain graph views
 - worker registry and capability model as data structures only
+- dynamic LLM provider and model route configuration
+- MCP and Skills registry foundations
 
 The MVP does not include:
 
@@ -75,6 +78,15 @@ Recommended first implementation order:
 6. `apps/worker` minimal registry/mock only
 7. `apps/cli` after pairing and local operations are better defined
 
+The current implementation should treat the following design documents as MVP slices:
+
+- [LLM Integration MVP](llm-integration-mvp.md)
+- [Dynamic LLM Configuration Design](dynamic-llm-config-design.md)
+- [Agent Runtime MVP Design](agent-runtime-mvp-design.md)
+- [Agent Workbench UI Design](agent-workbench-ui-design.md)
+- [Internationalization MVP](i18n-mvp-design.md)
+- [MCP And Skills MVP Design](mcp-and-skills-mvp-design.md)
+
 ## Technology Recommendation
 
 Use TypeScript for the first version.
@@ -89,6 +101,7 @@ Recommended baseline:
 - migrations: Drizzle Kit or Kysely migrations
 - Web UI: React + Vite
 - graph visualization: React Flow or Cytoscape.js
+- localization: typed translation dictionaries or a lightweight i18n library
 - shared schemas: Zod
 
 The exact framework can still be finalized before implementation. The important choice is to keep protocol, memory, and policy types shared between Brain and Web from the start.
@@ -109,6 +122,7 @@ Initial tables:
 - `audit_log`
 - `workers`
 - `worker_capabilities`
+- `settings`
 
 Core graph fields:
 
@@ -223,6 +237,9 @@ GET    /api/graph/views/:view
 GET    /api/workers
 POST   /api/workers/register-mock
 GET    /api/audit
+
+GET    /api/settings
+PATCH  /api/settings
 ```
 
 Streaming updates can be added with Server-Sent Events first:
@@ -261,7 +278,21 @@ The first Web UI should have four primary surfaces:
    - what it rejected or quarantined
    - why an item needs attention
 
+5. Settings
+   - interface language
+   - assistant reply language
+   - model/provider configuration status
+   - privacy and data handling notes
+
 The UI should not try to show the full graph all at once. Domain views are the default.
+
+The Web UI should be implemented as an Agent Workbench rather than a chat-only page. The detailed UI design is defined in:
+
+- [docs/agent-workbench-ui-design.md](agent-workbench-ui-design.md)
+
+The Web UI must support English and Simplified Chinese in the MVP. Language switching is defined in:
+
+- [docs/i18n-mvp-design.md](i18n-mvp-design.md)
 
 ## Worker MVP Position
 
@@ -294,6 +325,11 @@ The MVP must include real conversation capability through an LLM provider bounda
 The detailed LLM MVP plan is defined in:
 
 - [docs/llm-integration-mvp.md](llm-integration-mvp.md)
+- [docs/dynamic-llm-config-design.md](dynamic-llm-config-design.md)
+
+The detailed Agent Runtime plan is defined in:
+
+- [docs/agent-runtime-mvp-design.md](agent-runtime-mvp-design.md)
 
 The Brain should support both:
 
@@ -307,6 +343,8 @@ LLM_PROVIDER=mock | openai
 OPENAI_API_KEY=...
 OPENAI_MODEL=...
 ```
+
+Assistant replies should follow the configured assistant reply language. The UI language and assistant reply language are related but separate settings.
 
 The MVP should route all LLM work through a small internal service boundary:
 
@@ -361,6 +399,8 @@ The MVP is useful when a fresh user can:
 6. ask a later question and get a response influenced by approved memory
 7. inspect why Sedna believes something
 8. see an audit trail of important memory changes
+9. switch the Web UI between English and Simplified Chinese
+10. choose whether assistant replies follow the interface language, English, or Simplified Chinese
 
 ## Next Design Slice
 
