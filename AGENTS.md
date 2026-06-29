@@ -10,6 +10,7 @@ The current source of truth is:
 
 - `docs/personal-agent-design-checkpoint.md`
 - `docs/brain-mvp-design.md`
+- `docs/llm-integration-mvp.md`
 
 Do not treat the old Electron app or terminal workbench as the product direction. Those prototypes were intentionally removed.
 

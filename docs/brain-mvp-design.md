@@ -289,10 +289,32 @@ Real pairing and read-only file search can be the next slice after Brain memory 
 
 ## LLM Integration
 
-The MVP should route LLM work through a small internal service boundary:
+The MVP must include real conversation capability through an LLM provider boundary. A chat UI with only mocked replies is not enough to prove Sedna's core value.
+
+The detailed LLM MVP plan is defined in:
+
+- [docs/llm-integration-mvp.md](llm-integration-mvp.md)
+
+The Brain should support both:
+
+- `mock`: deterministic provider for tests and local demos without secrets
+- `openai`: real provider for actual conversation
+
+Configuration:
 
 ```text
-message
+LLM_PROVIDER=mock | openai
+OPENAI_API_KEY=...
+OPENAI_MODEL=...
+```
+
+The MVP should route all LLM work through a small internal service boundary:
+
+```text
+owner message
+-> context builder
+-> assistant reply prompt
+-> assistant message
 -> extraction prompt
 -> structured candidate memories
 -> policy classification
@@ -302,6 +324,8 @@ message
 The model should return structured output validated by Zod before writing anything.
 
 No candidate should become active without policy evaluation.
+
+The first implementation can be synchronous. Streaming, embeddings, local models, and multi-provider routing are out of scope for this MVP.
 
 ## Privacy And Local Data
 
