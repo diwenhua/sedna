@@ -1067,7 +1067,7 @@ The UI should be chat-first, with supporting panels for:
 
 - current understanding summary
 - memory candidates
-- confirmed profile facts
+- confirmed owner profile attributes with open vocabulary keys
 - projects, goals, and tasks
 - next-step suggestions
 - conflicts or uncertain memories requiring review

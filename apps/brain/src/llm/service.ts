@@ -1,8 +1,8 @@
 import type { LlmProviderConfigSecret, MemoryStore } from "@sedna/memory";
 import type { LlmModelRoute, LlmRoutePurpose } from "@sedna/protocol";
-import { MockLlmProvider } from "./mock-provider.js";
 import { buildChatMessages } from "./prompts/chat.js";
 import { buildExtractMemoryPrompt } from "./prompts/extract-memory.js";
+import { parseModelJson } from "./json.js";
 import { extractionJsonSchema } from "./schemas.js";
 import type { LlmConversationInput, LlmExtractionInput, LlmProvider, LlmTextResult } from "./provider.js";
 
@@ -21,7 +21,6 @@ export interface LlmConnectionTestResult {
 export class RoutedLlmService implements LlmProvider {
   readonly name = "routed";
   private readonly fetchImpl: typeof fetch;
-  private readonly mockProvider = new MockLlmProvider();
 
   constructor(private readonly store: MemoryStore, options: LlmServiceOptions = {}) {
     this.fetchImpl = options.fetchImpl ?? fetch;
@@ -29,10 +28,6 @@ export class RoutedLlmService implements LlmProvider {
 
   async generateAssistantReply(input: LlmConversationInput): Promise<LlmTextResult> {
     const { route, provider } = this.resolveRoute("chat_reply");
-    if (provider.adapterType === "mock") {
-      const reply = await this.mockProvider.generateAssistantReply(input);
-      return { ...reply, model: route.model };
-    }
     return {
       content: await this.callTextModel(provider, route, buildChatMessages(input), false),
       provider: provider.displayName,
@@ -45,10 +40,6 @@ export class RoutedLlmService implements LlmProvider {
     onDelta: (delta: string) => void | Promise<void>
   ): Promise<LlmTextResult> {
     const { route, provider } = this.resolveRoute("chat_reply");
-    if (provider.adapterType === "mock") {
-      const reply = await this.mockProvider.streamAssistantReply(input, onDelta);
-      return { ...reply, model: route.model };
-    }
     const content = await this.callStreamingTextModel(provider, route, buildChatMessages(input), onDelta);
     return {
       content,
@@ -59,15 +50,12 @@ export class RoutedLlmService implements LlmProvider {
 
   async extractMemoryCandidates(input: LlmExtractionInput): Promise<unknown> {
     const { route, provider } = this.resolveRoute("memory_extraction");
-    if (provider.adapterType === "mock") {
-      return this.mockProvider.extractMemoryCandidates(input);
-    }
     const messages = [
       { role: "system" as const, content: "Return only JSON that matches the provided candidate memory schema." },
       { role: "user" as const, content: buildExtractMemoryPrompt(input) }
     ];
     const content = await this.callTextModel(provider, route, messages, true);
-    return JSON.parse(content) as unknown;
+    return parseModelJson(content);
   }
 
   async testProvider(providerConfigId: string): Promise<LlmConnectionTestResult> {
@@ -82,15 +70,6 @@ export class RoutedLlmService implements LlmProvider {
         adapterType: provider.adapterType,
         model: provider.defaultModel,
         message: "Provider is disabled."
-      };
-    }
-    if (provider.adapterType === "mock") {
-      return {
-        ok: true,
-        providerConfigId,
-        adapterType: provider.adapterType,
-        model: provider.defaultModel,
-        message: "Mock provider is available."
       };
     }
     if (!provider.apiKey) {
@@ -135,13 +114,13 @@ export class RoutedLlmService implements LlmProvider {
   private resolveRoute(purpose: LlmRoutePurpose): { route: LlmModelRoute; provider: LlmProviderConfigSecret } {
     const route = this.store.getLlmModelRoute(purpose);
     if (!route || !route.enabled) {
-      throw new Error(`LLM route is not enabled: ${purpose}`);
+      throw new Error("No LLM provider configured. Configure one in Settings.");
     }
     const provider = this.store.getLlmProviderConfigWithSecret(route.providerConfigId);
     if (!provider || !provider.enabled) {
-      throw new Error(`LLM provider is not enabled for route: ${purpose}`);
+      throw new Error("No LLM provider configured. Configure one in Settings.");
     }
-    if (provider.adapterType !== "mock" && !provider.apiKey) {
+    if (!provider.apiKey) {
       throw new Error(`LLM provider ${provider.displayName} requires an API key.`);
     }
     return { route, provider };
@@ -367,10 +346,13 @@ export class RoutedLlmService implements LlmProvider {
       })
     });
     return readSseText(response, async (event) => {
-      const delta = (event as { delta?: { text?: string } }).delta?.text;
-      if (typeof delta === "string" && delta.length > 0) {
-        await onDelta(delta);
-        return delta;
+      const type = typeof event.type === "string" ? event.type : "";
+      if (type === "content_block_delta") {
+        const delta = (event as { delta?: { type?: string; text?: string } }).delta;
+        if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text.length > 0) {
+          await onDelta(delta.text);
+          return delta.text;
+        }
       }
       return "";
     });

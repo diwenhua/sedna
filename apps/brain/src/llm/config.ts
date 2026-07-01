@@ -1,4 +1,3 @@
-import { MockLlmProvider } from "./mock-provider.js";
 import { OpenAiLlmProvider } from "./openai-provider.js";
 import type { LlmProvider } from "./provider.js";
 import type { MemoryStore } from "@sedna/memory";
@@ -10,13 +9,13 @@ export interface LlmEnv {
 }
 
 export function createLlmProviderFromEnv(env: LlmEnv = process.env): LlmProvider {
-  const provider = env.LLM_PROVIDER ?? "mock";
-  if (provider === "mock") {
-    return new MockLlmProvider();
+  const provider = env.LLM_PROVIDER;
+  if (!provider) {
+    throw new Error("No LLM provider configured. Configure one in Settings.");
   }
   if (provider === "openai") {
     if (!env.OPENAI_API_KEY) {
-      throw new Error("OpenAI provider requires OPENAI_API_KEY. Set OPENAI_API_KEY or use LLM_PROVIDER=mock.");
+      throw new Error("OpenAI provider requires OPENAI_API_KEY.");
     }
     return new OpenAiLlmProvider({
       apiKey: env.OPENAI_API_KEY,
@@ -27,26 +26,27 @@ export function createLlmProviderFromEnv(env: LlmEnv = process.env): LlmProvider
 }
 
 export function syncLlmEnvConfig(store: MemoryStore, env: LlmEnv = process.env): void {
-  const provider = env.LLM_PROVIDER ?? "mock";
-  if (provider === "mock") {
+  const provider = env.LLM_PROVIDER?.trim();
+  if (!provider) {
     return;
   }
   if (provider !== "openai") {
     throw new Error(`Unsupported LLM_PROVIDER: ${provider}`);
   }
-  if (!env.OPENAI_API_KEY) {
-    throw new Error("OpenAI provider requires OPENAI_API_KEY. Set OPENAI_API_KEY or use LLM_PROVIDER=mock.");
+  const apiKey = env.OPENAI_API_KEY?.trim();
+  if (!apiKey) {
+    return;
   }
 
   const existing = store.listLlmProviderConfigs().find((config) => config.displayName === "OpenAI from environment");
-  const model = env.OPENAI_MODEL ?? "gpt-4.1-mini";
+  const model = env.OPENAI_MODEL?.trim() || "gpt-4.1-mini";
   const config = existing
     ? store.updateLlmProviderConfig(existing.id, {
         presetId: "openai",
         displayName: "OpenAI from environment",
         adapterType: "openai-native",
         baseUrl: "https://api.openai.com/v1",
-        apiKey: env.OPENAI_API_KEY,
+        apiKey,
         defaultModel: model,
         enabled: true
       })
@@ -55,7 +55,7 @@ export function syncLlmEnvConfig(store: MemoryStore, env: LlmEnv = process.env):
         displayName: "OpenAI from environment",
         adapterType: "openai-native",
         baseUrl: "https://api.openai.com/v1",
-        apiKey: env.OPENAI_API_KEY,
+        apiKey,
         defaultModel: model,
         enabled: true
       });
@@ -64,7 +64,7 @@ export function syncLlmEnvConfig(store: MemoryStore, env: LlmEnv = process.env):
     providerConfigId: config.id,
     model,
     temperature: 0.2,
-    maxTokens: 1200,
+    maxTokens: 16384,
     enabled: true
   });
   store.updateLlmModelRoute("memory_extraction", {

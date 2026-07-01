@@ -1,7 +1,9 @@
 import { DatabaseSync } from "node:sqlite";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { evaluateMemoryCandidate } from "@sedna/policy";
 import type {
   AuditRecord,
+  Capability,
   Conversation,
   Event,
   EventType,
@@ -22,16 +24,52 @@ import type {
   MemoryCandidate,
   MemoryStatus,
   Message,
+  OwnerProfile,
+  ProfileAttribute,
+  ProfileAttributeHistory,
+  ProfilePatchOperation,
+  ProfilePatchProposal,
+  ProfileSemanticType,
   RiskLevel,
   Settings,
   SkillDefinition,
   SkillRun,
   SkillSourceType,
   ToolRegistryEntry,
-  Worker
+  WebSearchProvider,
+  WebToolsSettings,
+  Worker,
+  WorkerEvent,
+  WorkerJob,
+  WorkerJobStatus,
+  WorkerPathScope
 } from "@sedna/protocol";
 
 type JsonRecord = Record<string, unknown>;
+
+const WORKER_OFFLINE_AFTER_MS = 45_000;
+
+export interface WebToolsConfig {
+  enabled: boolean;
+  searchProvider: WebSearchProvider;
+  braveApiKey?: string;
+  dashscopeApiKey?: string;
+  searxngUrl?: string;
+  fetchMaxChars: number;
+  fetchTimeoutMs: number;
+  searchMaxResults: number;
+}
+
+export interface WebToolsSettingsPatch {
+  enabled?: boolean;
+  searchProvider?: WebSearchProvider;
+  searchMaxResults?: number;
+  fetchMaxChars?: number;
+  fetchTimeoutMs?: number;
+  searxngUrl?: string | null;
+  braveApiKey?: string;
+  dashscopeApiKey?: string;
+}
 
 export interface LlmProviderConfigInput {
   presetId?: string;
@@ -96,6 +134,78 @@ export interface MockWorkerInput {
   }>;
 }
 
+export interface WorkerCapabilityInput {
+  name: string;
+  risk: RiskLevel;
+  readOnly: boolean;
+  requiresConfirmation: boolean;
+  enabled?: boolean;
+  allowedScopes?: string[];
+  inputSchema?: JsonRecord;
+  outputSchema?: JsonRecord;
+}
+
+export interface RegisterWorkerInput {
+  displayName: string;
+  environment: string;
+  hostName?: string;
+  os?: string;
+  location?: string;
+  metadata?: JsonRecord;
+  capabilities?: WorkerCapabilityInput[];
+  pathScopes?: Array<{
+    label: string;
+    path: string;
+    mode?: "read_only" | "read_write";
+    enabled?: boolean;
+  }>;
+}
+
+export interface WorkerPairCode {
+  id: string;
+  code?: string;
+  status: "pending" | "used" | "expired" | "revoked";
+  expiresAt: string;
+  createdAt: string;
+  usedAt?: string;
+}
+
+export interface PairWorkerInput extends RegisterWorkerInput {
+  code: string;
+}
+
+export interface WorkerPathScopeInput {
+  label: string;
+  path: string;
+  mode?: "read_only" | "read_write";
+  enabled?: boolean;
+}
+
+export interface WorkerCapabilityPolicyPatch {
+  enabled?: boolean;
+  risk?: RiskLevel;
+  requiresConfirmation?: boolean;
+}
+
+export interface WorkerPathScopePatch {
+  label?: string;
+  path?: string;
+  mode?: "read_only" | "read_write";
+  enabled?: boolean;
+}
+
+export interface WorkerPolicySnapshot {
+  capabilities: Capability[];
+  pathScopes: WorkerPathScope[];
+}
+
+export interface WorkerJobInput {
+  workerId: string;
+  capability: string;
+  input: JsonRecord;
+  timeoutMs?: number;
+}
+
 export interface McpServerInput {
   name: string;
   transport: McpTransport;
@@ -156,13 +266,12 @@ export interface SkillDefinitionInput {
   requiredTools?: string[];
   riskLevel?: RiskLevel;
   enabled?: boolean;
+  storagePath?: string;
 }
 
 const DEFAULT_OWNER_NODE_ID = "node_owner";
-const DEFAULT_MOCK_PROVIDER_ID = "provider_mock";
-
+const DEFAULT_OWNER_PROFILE_ID = "profile_owner";
 const LLM_PROVIDER_PRESETS: LlmProviderPreset[] = [
-  { id: "mock", displayName: "Mock", adapterType: "mock", defaultModel: "mock-deterministic", enabledByDefault: true },
   { id: "openai", displayName: "OpenAI", adapterType: "openai-native", baseUrl: "https://api.openai.com/v1", defaultModel: "gpt-4.1-mini", enabledByDefault: false },
   { id: "anthropic", displayName: "Anthropic Claude", adapterType: "anthropic", baseUrl: "https://api.anthropic.com/v1", defaultModel: "claude-3-5-sonnet-latest", enabledByDefault: false },
   { id: "gemini", displayName: "Google Gemini", adapterType: "gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta", defaultModel: "gemini-1.5-flash", enabledByDefault: false },
@@ -197,10 +306,22 @@ export class MemoryStore {
     this.addColumnIfMissing("messages", "locale", "TEXT NOT NULL DEFAULT 'unknown'");
     this.addColumnIfMissing("evidence", "locale", "TEXT NOT NULL DEFAULT 'unknown'");
     this.addColumnIfMissing("memory_candidates", "locale", "TEXT NOT NULL DEFAULT 'unknown'");
+    this.addColumnIfMissing("workers", "host_name", "TEXT");
+    this.addColumnIfMissing("workers", "os", "TEXT");
+    this.addColumnIfMissing("workers", "credential_hash", "TEXT");
+    this.addColumnIfMissing("worker_capabilities", "enabled", "INTEGER NOT NULL DEFAULT 1");
+    this.addColumnIfMissing("worker_capabilities", "updated_at", "TEXT");
+    this.addColumnIfMissing("skill_definitions", "storage_path", "TEXT");
+    this.db.prepare("UPDATE llm_model_routes SET max_tokens = 16384 WHERE purpose = 'chat_reply' AND max_tokens <= 1200").run();
     this.seedLlmProviderPresets();
-    this.ensureDefaultLlmProviderAndRoutes();
+    this.removeProductMockLlmProvider();
     this.ensureInternalTools();
-    this.ensureBuiltInSkills();
+    this.removeLegacyBuiltInSkills();
+    this.removeLegacyMockMcpServers();
+    this.removeLegacyBailianWebSearchMcpServers();
+    this.ensureOwnerProfile();
+    this.migrateProfileAttributeHistoryForeignKey();
+    this.deduplicateMemoryCandidates();
   }
 
   close(): void {
@@ -269,6 +390,7 @@ export class MemoryStore {
       adapterType: input.adapterType,
       hasApiKey: Boolean(input.apiKey)
     });
+    this.ensureRoutesForFirstProvider(configId, input.defaultModel);
     return this.requireLlmProviderConfig(configId);
   }
 
@@ -338,15 +460,17 @@ export class MemoryStore {
 
   updateLlmModelRoute(purpose: LlmRoutePurpose, patch: LlmModelRoutePatch): LlmModelRoute {
     const current = this.getLlmModelRoute(purpose);
-    const mockProvider = this.requireLlmProviderConfig(DEFAULT_MOCK_PROVIDER_ID);
-    const providerConfigId = patch.providerConfigId ?? current?.providerConfigId ?? mockProvider.id;
+    const providerConfigId = patch.providerConfigId ?? current?.providerConfigId;
+    if (!providerConfigId) {
+      throw new Error("No LLM provider configured. Configure one in Settings.");
+    }
     const provider = this.requireLlmProviderConfig(providerConfigId);
     const providerChanged = Boolean(patch.providerConfigId && patch.providerConfigId !== current?.providerConfigId);
     const next = {
       providerConfigId,
       model: patch.model ?? (providerChanged ? provider.defaultModel : current?.model) ?? provider.defaultModel,
       temperature: patch.temperature ?? current?.temperature ?? 0.2,
-      maxTokens: patch.maxTokens ?? current?.maxTokens ?? 1200,
+      maxTokens: patch.maxTokens ?? current?.maxTokens ?? 16384,
       enabled: patch.enabled ?? current?.enabled ?? true,
       updatedAt: nowIso()
     };
@@ -415,6 +539,77 @@ export class MemoryStore {
     return next;
   }
 
+  getWebToolsSettings(): WebToolsSettings {
+    this.ensureDefaultWebToolsSettings();
+    const withSecrets = this.getWebToolsSettingsWithSecrets();
+    return {
+      enabled: withSecrets.enabled,
+      searchProvider: withSecrets.searchProvider,
+      searchMaxResults: withSecrets.searchMaxResults,
+      fetchMaxChars: withSecrets.fetchMaxChars,
+      fetchTimeoutMs: withSecrets.fetchTimeoutMs,
+      searxngUrl: withSecrets.searxngUrl,
+      hasBraveApiKey: Boolean(withSecrets.braveApiKey),
+      hasDashscopeApiKey: Boolean(withSecrets.dashscopeApiKey),
+      configured: isWebToolsRuntimeConfigured(withSecrets),
+      updatedAt: withSecrets.updatedAt
+    };
+  }
+
+  getWebToolsConfig(): WebToolsConfig {
+    const settings = this.getWebToolsSettingsWithSecrets();
+    return {
+      enabled: settings.enabled,
+      searchProvider: settings.searchProvider,
+      braveApiKey: settings.braveApiKey,
+      dashscopeApiKey: settings.dashscopeApiKey,
+      searxngUrl: settings.searxngUrl,
+      fetchMaxChars: settings.fetchMaxChars,
+      fetchTimeoutMs: settings.fetchTimeoutMs,
+      searchMaxResults: settings.searchMaxResults
+    };
+  }
+
+  updateWebToolsSettings(patch: WebToolsSettingsPatch): WebToolsSettings {
+    this.ensureDefaultWebToolsSettings();
+    const current = this.getWebToolsSettingsWithSecrets();
+    const updatedAt = nowIso();
+    const next = {
+      enabled: patch.enabled ?? current.enabled,
+      searchProvider: patch.searchProvider ?? current.searchProvider,
+      searchMaxResults: patch.searchMaxResults ?? current.searchMaxResults,
+      fetchMaxChars: patch.fetchMaxChars ?? current.fetchMaxChars,
+      fetchTimeoutMs: patch.fetchTimeoutMs ?? current.fetchTimeoutMs,
+      searxngUrl: patch.searxngUrl === null ? undefined : patch.searxngUrl ?? current.searxngUrl,
+      braveApiKey: patch.braveApiKey && patch.braveApiKey.length > 0 ? patch.braveApiKey : current.braveApiKey,
+      dashscopeApiKey: patch.dashscopeApiKey && patch.dashscopeApiKey.length > 0 ? patch.dashscopeApiKey : current.dashscopeApiKey,
+      updatedAt
+    };
+    this.upsertSetting("web.tools.enabled", next.enabled, updatedAt);
+    this.upsertSetting("web.search.provider", next.searchProvider, updatedAt);
+    this.upsertSetting("web.search.max_results", next.searchMaxResults, updatedAt);
+    this.upsertSetting("web.fetch.max_chars", next.fetchMaxChars, updatedAt);
+    this.upsertSetting("web.fetch.timeout_ms", next.fetchTimeoutMs, updatedAt);
+    this.upsertSetting("web.searxng.url", next.searxngUrl ?? null, updatedAt);
+    if (patch.braveApiKey && patch.braveApiKey.length > 0) {
+      this.upsertSetting("web.brave.api_key_secret", patch.braveApiKey, updatedAt);
+    }
+    if (patch.dashscopeApiKey && patch.dashscopeApiKey.length > 0) {
+      this.upsertSetting("web.dashscope.api_key_secret", patch.dashscopeApiKey, updatedAt);
+    }
+    this.createEvent("web.tools.updated", "Web tools settings updated", {
+      enabled: next.enabled,
+      searchProvider: next.searchProvider,
+      configured: isWebToolsRuntimeConfigured(next)
+    });
+    this.createAuditRecord("owner", "web.tools.updated", "settings", "web_tools", {
+      enabled: next.enabled,
+      searchProvider: next.searchProvider,
+      configured: isWebToolsRuntimeConfigured(next)
+    });
+    return this.getWebToolsSettings();
+  }
+
   createConversation(title = "New conversation"): Conversation {
     const now = nowIso();
     const conversation: Conversation = {
@@ -456,6 +651,49 @@ export class MemoryStore {
     };
   }
 
+  renameConversation(id: string, title: string): Conversation {
+    const current = this.getConversation(id);
+    if (!current) {
+      throw new Error(`Conversation not found: ${id}`);
+    }
+    const updatedAt = nowIso();
+    this.db.prepare("UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?").run(title, updatedAt, id);
+    this.createEvent("conversation.renamed", "Conversation renamed", {
+      conversationId: id,
+      previousTitle: current.title,
+      title
+    }, {
+      relatedConversationId: id
+    });
+    this.createAuditRecord("owner", "conversation.rename", "conversation", id, {
+      previousTitle: current.title,
+      title
+    });
+    const renamed = this.getConversation(id);
+    if (!renamed) {
+      throw new Error(`Conversation not found after rename: ${id}`);
+    }
+    const { messages: _messages, ...conversation } = renamed;
+    return conversation;
+  }
+
+  deleteConversation(id: string): void {
+    const current = this.getConversation(id);
+    if (!current) {
+      throw new Error(`Conversation not found: ${id}`);
+    }
+    this.db.prepare("DELETE FROM conversations WHERE id = ?").run(id);
+    this.createEvent("conversation.deleted", "Conversation deleted", {
+      conversationId: id,
+      title: current.title
+    }, {
+      relatedConversationId: id
+    });
+    this.createAuditRecord("owner", "conversation.delete", "conversation", id, {
+      title: current.title
+    });
+  }
+
   listMessages(conversationId: string): Message[] {
     return this.db
       .prepare("SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC")
@@ -472,23 +710,39 @@ export class MemoryStore {
   }
 
   listActiveMemoryNodes(query?: string, limit = 12): GraphNode[] {
-    const normalizedQuery = query?.toLowerCase() ?? "";
-    return this.db
+    const queryText = query?.toLowerCase().trim() ?? "";
+    const nodes = this.db
       .prepare("SELECT * FROM nodes WHERE status = ? ORDER BY updated_at DESC LIMIT ?")
-      .all("active", Math.max(limit * 3, limit))
+      .all("active", Math.max(limit * 8, limit))
       .map(mapGraphNode)
-      .filter((node) => node.type !== "owner")
-      .filter((node) => {
-        if (!normalizedQuery) {
-          return true;
+      .filter((node) => node.type !== "owner" && node.type !== "owner_profile");
+    if (!queryText) {
+      return nodes.slice(0, limit);
+    }
+    return nodes
+      .map((node) => ({ node, score: scoreMemoryNodeForQuery(node, queryText) }))
+      .filter((item) => item.score > 0)
+      .sort((left, right) => {
+        const scoreDelta = right.score - left.score;
+        if (scoreDelta !== 0) {
+          return scoreDelta;
         }
-        const haystack = `${node.type} ${node.label} ${JSON.stringify(node.payload)}`.toLowerCase();
-        return normalizedQuery
-          .split(/\W+/)
-          .filter((part) => part.length >= 4)
-          .some((part) => haystack.includes(part));
+        return right.node.updatedAt.localeCompare(left.node.updatedAt);
       })
+      .map((item) => item.node)
       .slice(0, limit);
+  }
+
+  private listProfileAttributeNodes(statuses: MemoryStatus[]): GraphNode[] {
+    if (statuses.length === 0) {
+      return [];
+    }
+    const graphStatuses = [...new Set(statuses.map((status) => (status === "observed" ? "candidate" : status)))];
+    const placeholders = graphStatuses.map(() => "?").join(", ");
+    return this.db
+      .prepare(`SELECT * FROM nodes WHERE type = 'profile_attribute' AND status IN (${placeholders}) ORDER BY updated_at DESC`)
+      .all(...graphStatuses)
+      .map(mapGraphNode);
   }
 
   createMessage(conversationId: string, role: Message["role"], content: string, metadata: JsonRecord = {}): Message {
@@ -559,9 +813,7 @@ export class MemoryStore {
       conversationId
     });
 
-    const candidates = this.extractMemories(content).map((memory) =>
-      this.createMemoryCandidate(memory, ownerMessage)
-    );
+    const candidates = this.createMemoryCandidatesFromMessage(ownerMessage);
     const activeMemoryLabels = this.getGraph().nodes
       .filter((node) => node.type !== "owner")
       .map((node) => node.label);
@@ -648,6 +900,138 @@ export class MemoryStore {
     return this.requireMemoryCandidate(id);
   }
 
+  getOwnerProfile(): OwnerProfile {
+    this.ensureOwnerProfile();
+    const profileRow = this.db.prepare("SELECT * FROM profiles WHERE id = ?").get(DEFAULT_OWNER_PROFILE_ID);
+    if (!profileRow) {
+      throw new Error("Owner profile not found");
+    }
+    const attributes = this.listProfileAttributeNodes(["active", "candidate", "quarantined", "superseded", "expired", "rejected", "observed"])
+      .map((node) => ({
+        ...profileAttributeFromNode(node),
+        history: this.listProfileAttributeHistory(node.id)
+      }))
+      .sort((left, right) => {
+        const typeDelta = left.semanticType.localeCompare(right.semanticType);
+        if (typeDelta !== 0) {
+          return typeDelta;
+        }
+        const keyDelta = left.key.localeCompare(right.key);
+        if (keyDelta !== 0) {
+          return keyDelta;
+        }
+        return left.createdAt.localeCompare(right.createdAt);
+      });
+    return {
+      id: String(profileRow.id),
+      ownerId: String(profileRow.owner_id),
+      createdAt: String(profileRow.created_at),
+      updatedAt: String(profileRow.updated_at),
+      attributes
+    };
+  }
+
+  applyProfilePatchProposal(proposal: ProfilePatchProposal, message: Message): ProfileAttribute | undefined {
+    this.ensureOwnerProfile();
+    const now = nowIso();
+    const evidenceId = createId("ev");
+    this.db
+      .prepare(
+        "INSERT INTO evidence (id, source_type, source_id, quote, artifact_ref, locale, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      )
+      .run(evidenceId, "message", message.id, proposal.evidenceQuote, null, message.locale ?? "unknown", now);
+
+    const existing = this.findProfileAttribute(proposal.attributeKey);
+    const policy = evaluateMemoryCandidate({
+      risk: proposal.risk,
+      confidence: proposal.confidence,
+      hasConflict: existing ? existing.normalizedValue !== proposal.normalizedValue && proposal.operation !== "replace" : false
+    });
+    const operation = normalizeProfileOperation(proposal, existing);
+
+    if (operation === "ignore") {
+      if (existing) {
+        this.createProfileAttributeHistory(existing.id, "ignore", existing.value, proposal.value, evidenceId, proposal.reason);
+        this.createEvent("profile.attribute_ignored", "Profile attribute ignored", {
+          attributeId: existing.id,
+          key: existing.key,
+          reason: proposal.reason
+        });
+        this.createAuditRecord("assistant", "profile.attribute.ignore", "profile_attribute", existing.id, {
+          key: existing.key,
+          reason: proposal.reason
+        });
+      }
+      return existing;
+    }
+
+    if (operation === "conflict") {
+      const attribute = existing ?? this.insertProfileAttribute(proposal, evidenceId, "quarantined", true);
+      this.createProfileAttributeHistory(attribute.id, "conflict", existing?.value, proposal.value, evidenceId, proposal.reason);
+      this.updateProfileAttributeNode(attribute.id, {
+        status: "quarantined",
+        requiresConfirmation: true,
+        updatedAt: now
+      });
+      this.createEvent("profile.attribute_conflict", "Profile attribute conflict", {
+        attributeId: attribute.id,
+        key: attribute.key,
+        normalizedValue: proposal.normalizedValue
+      });
+      this.createAuditRecord("assistant", "profile.attribute.conflict", "profile_attribute", attribute.id, {
+        key: attribute.key,
+        normalizedValue: proposal.normalizedValue
+      });
+      return this.requireProfileAttribute(attribute.id);
+    }
+
+    if (!existing) {
+      const status = proposal.operation === "ask_confirmation" ? "candidate" : policy.status;
+      const attribute = this.insertProfileAttribute(proposal, evidenceId, status, policy.requiresConfirmation || proposal.operation === "ask_confirmation");
+      this.createProfileAttributeHistory(attribute.id, "add", undefined, proposal.value, evidenceId, proposal.reason);
+      this.createEvent("profile.attribute_added", "Profile attribute added", {
+        attributeId: attribute.id,
+        key: attribute.key,
+        status: attribute.status,
+        risk: attribute.risk
+      });
+      this.createAuditRecord("assistant", "profile.attribute.add", "profile_attribute", attribute.id, {
+        key: attribute.key,
+        status: attribute.status,
+        risk: attribute.risk
+      });
+      this.touchOwnerProfile(now);
+      return attribute;
+    }
+
+    const status = proposal.operation === "ask_confirmation" ? "candidate" : policy.status;
+    this.updateProfileAttributeNode(existing.id, {
+      semanticType: proposal.semanticType,
+      value: proposal.value,
+      normalizedValue: proposal.normalizedValue,
+      confidence: proposal.confidence,
+      risk: proposal.risk,
+      status,
+      latestEvidenceId: evidenceId,
+      requiresConfirmation: policy.requiresConfirmation || proposal.operation === "ask_confirmation",
+      updatedAt: now
+    });
+    this.createProfileAttributeHistory(existing.id, operation, existing.value, proposal.value, evidenceId, proposal.reason);
+    this.createEvent("profile.attribute_updated", "Profile attribute updated", {
+      attributeId: existing.id,
+      key: existing.key,
+      operation,
+      status
+    });
+    this.createAuditRecord("assistant", "profile.attribute.update", "profile_attribute", existing.id, {
+      key: existing.key,
+      operation,
+      status
+    });
+    this.touchOwnerProfile(now);
+    return this.requireProfileAttribute(existing.id);
+  }
+
   getGraph(filter: { view?: string } = {}): GraphResponse {
     const view = filter.view?.toLowerCase();
     const nodes = this.db
@@ -659,10 +1043,26 @@ export class MemoryStore {
           return true;
         }
         if (view === "worker") {
-          return node.type === "worker" || node.type === "capability";
+          if (node.status === "rejected") {
+            return false;
+          }
+          if (node.type === "worker") {
+            const workerId = node.scopeId ?? node.id.replace(/^node_/, "");
+            const worker = this.getWorker(workerId);
+            return worker != null && worker.status !== "revoked";
+          }
+          if (node.type === "capability") {
+            const workerId = node.scopeId;
+            if (!workerId) {
+              return false;
+            }
+            const worker = this.getWorker(workerId);
+            return worker != null && worker.status !== "revoked";
+          }
+          return false;
         }
         if (view === "profile") {
-          return ["owner", "preference", "constraint", "goal"].includes(node.type);
+          return ["owner", "owner_profile", "profile_attribute"].includes(node.type);
         }
         if (view === "project") {
           return node.type === "project";
@@ -703,13 +1103,15 @@ export class MemoryStore {
     this.db
       .prepare(
         `INSERT INTO workers
-         (id, display_name, environment, location, status, metadata_json, last_seen_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         (id, display_name, environment, host_name, os, location, status, metadata_json, last_seen_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         worker.id,
         worker.displayName,
         worker.environment,
+        null,
+        null,
         worker.location ?? null,
         worker.status,
         stringify(worker.metadata),
@@ -738,8 +1140,8 @@ export class MemoryStore {
       this.db
         .prepare(
           `INSERT INTO worker_capabilities
-           (id, worker_id, name, risk, read_only, requires_confirmation, allowed_scopes_json, input_schema_json, output_schema_json, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           (id, worker_id, name, risk, read_only, requires_confirmation, allowed_scopes_json, input_schema_json, output_schema_json, enabled, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           capabilityId,
@@ -751,6 +1153,8 @@ export class MemoryStore {
           stringify(capability.allowedScopes ?? []),
           "{}",
           "{}",
+          1,
+          now,
           now
         );
       const capabilityNodeId = `node_${capabilityId}`;
@@ -781,10 +1185,517 @@ export class MemoryStore {
   }
 
   listWorkers(): Worker[] {
+    this.markStaleWorkersOffline();
     return this.db
       .prepare("SELECT * FROM workers ORDER BY created_at ASC")
       .all()
       .map(mapWorker);
+  }
+
+  getWorker(id: string): Worker | undefined {
+    this.markStaleWorkersOffline();
+    const row = this.db.prepare("SELECT * FROM workers WHERE id = ?").get(id);
+    return row ? mapWorker(row) : undefined;
+  }
+
+  registerWorker(input: RegisterWorkerInput): Worker {
+    const now = nowIso();
+    const worker: Worker = {
+      id: createId("worker"),
+      displayName: input.displayName,
+      environment: input.environment,
+      hostName: input.hostName,
+      os: input.os,
+      location: input.location,
+      status: "online",
+      metadata: input.metadata ?? {},
+      lastSeenAt: now,
+      createdAt: now,
+      updatedAt: now
+    };
+    this.db
+      .prepare(
+        `INSERT INTO workers
+         (id, display_name, environment, host_name, os, location, status, metadata_json, last_seen_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        worker.id,
+        worker.displayName,
+        worker.environment,
+        worker.hostName ?? null,
+        worker.os ?? null,
+        worker.location ?? null,
+        worker.status,
+        stringify(worker.metadata),
+        worker.lastSeenAt ?? null,
+        worker.createdAt,
+        worker.updatedAt
+      );
+    this.ensureWorkerGraphNode(worker, "worker-registry");
+    for (const capability of input.capabilities ?? []) {
+      this.upsertWorkerCapability(worker.id, capability);
+    }
+    for (const scope of input.pathScopes ?? []) {
+      this.createWorkerPathScope(worker.id, scope);
+    }
+    this.createWorkerEvent(worker.id, undefined, "worker.registered", {
+      displayName: worker.displayName,
+      environment: worker.environment
+    });
+    this.createEvent("worker.registered", "Worker registered", { workerId: worker.id, displayName: worker.displayName }, {
+      relatedWorkerId: worker.id,
+      relatedNodeId: `node_${worker.id}`
+    });
+    this.createAuditRecord("worker", "worker.register", "worker", worker.id, {
+      displayName: worker.displayName,
+      capabilities: (input.capabilities ?? []).map((capability) => capability.name)
+    });
+    return worker;
+  }
+
+  createWorkerPairCode(ttlMs = 10 * 60 * 1000): WorkerPairCode {
+    const now = nowIso();
+    const code = formatPairCode(randomBytes(5).toString("hex").toUpperCase());
+    const pairCode: WorkerPairCode = {
+      id: createId("worker_pair_code"),
+      code,
+      status: "pending",
+      expiresAt: new Date(Date.now() + ttlMs).toISOString(),
+      createdAt: now
+    };
+    this.db
+      .prepare(
+        `INSERT INTO worker_pair_codes (id, code_hash, status, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(pairCode.id, hashSecret(code), pairCode.status, pairCode.expiresAt, pairCode.createdAt);
+    this.createEvent("worker.pair_code.created", "Worker pair code created", { pairCodeId: pairCode.id, expiresAt: pairCode.expiresAt });
+    this.createAuditRecord("owner", "worker.pair_code.create", "worker_pair_code", pairCode.id, { expiresAt: pairCode.expiresAt });
+    return pairCode;
+  }
+
+  listWorkerPairCodes(): WorkerPairCode[] {
+    this.expireWorkerPairCodes();
+    return this.db
+      .prepare("SELECT id, status, expires_at, created_at, used_at FROM worker_pair_codes ORDER BY created_at DESC")
+      .all()
+      .map(mapWorkerPairCode);
+  }
+
+  pairWorker(input: PairWorkerInput): { worker: Worker; credential: string } {
+    this.expireWorkerPairCodes();
+    const pairCode = this.db
+      .prepare("SELECT * FROM worker_pair_codes WHERE code_hash = ? AND status = 'pending'")
+      .get(hashSecret(input.code)) as Record<string, unknown> | undefined;
+    if (!pairCode) {
+      throw new Error("Invalid or expired worker pair code.");
+    }
+    const now = nowIso();
+    const credential = `sedna_worker_${randomBytes(32).toString("base64url")}`;
+    const worker = this.registerWorkerWithCredential(input, hashSecret(credential));
+    this.db
+      .prepare("UPDATE worker_pair_codes SET status = 'used', used_at = ? WHERE id = ?")
+      .run(now, String(pairCode.id));
+    this.createEvent("worker.paired", "Worker paired", { workerId: worker.id, pairCodeId: pairCode.id }, { relatedWorkerId: worker.id });
+    this.createAuditRecord("worker", "worker.pair", "worker", worker.id, { pairCodeId: pairCode.id });
+    return { worker, credential };
+  }
+
+  authenticateWorker(workerId: string, credential: string | undefined): boolean {
+    if (!credential) {
+      return false;
+    }
+    const row = this.db.prepare("SELECT credential_hash, status FROM workers WHERE id = ?").get(workerId) as Record<string, unknown> | undefined;
+    if (!row || row.status === "revoked" || typeof row.credential_hash !== "string") {
+      return false;
+    }
+    return safeEqual(String(row.credential_hash), hashSecret(credential));
+  }
+
+  revokeWorker(workerId: string): Worker {
+    const worker = this.requireWorker(workerId);
+    const now = nowIso();
+    this.db
+      .prepare("UPDATE workers SET status = 'revoked', credential_hash = NULL, updated_at = ? WHERE id = ?")
+      .run(now, workerId);
+    const revoked = this.requireWorker(workerId);
+    this.markWorkerGraphRevoked(workerId, revoked.displayName, revoked);
+    this.createWorkerEvent(workerId, undefined, "worker.revoked", { previousStatus: worker.status });
+    this.createEvent("worker.revoked", "Worker revoked", { workerId }, { relatedWorkerId: workerId });
+    this.createAuditRecord("owner", "worker.revoke", "worker", workerId, { previousStatus: worker.status });
+    return revoked;
+  }
+
+  heartbeatWorker(workerId: string, metadata: JsonRecord = {}): Worker {
+    const worker = this.requireWorker(workerId);
+    if (worker.status === "revoked") {
+      throw new Error("Worker is revoked");
+    }
+    const now = nowIso();
+    const nextMetadata = { ...worker.metadata, ...metadata };
+    this.db
+      .prepare("UPDATE workers SET status = ?, metadata_json = ?, last_seen_at = ?, updated_at = ? WHERE id = ?")
+      .run("online", stringify(nextMetadata), now, now, workerId);
+    this.createWorkerEvent(workerId, undefined, "worker.heartbeat", { metadata });
+    this.createEvent("worker.heartbeat", "Worker heartbeat", { workerId }, { relatedWorkerId: workerId });
+    if (worker.status !== "online") {
+      this.createEvent("worker.online", "Worker online", { workerId }, { relatedWorkerId: workerId });
+    }
+    return this.requireWorker(workerId);
+  }
+
+  updateWorker(id: string, patch: Partial<Pick<Worker, "displayName" | "location" | "status">>): Worker {
+    const worker = this.requireWorker(id);
+    const now = nowIso();
+    this.db
+      .prepare("UPDATE workers SET display_name = ?, location = ?, status = ?, updated_at = ? WHERE id = ?")
+      .run(patch.displayName ?? worker.displayName, patch.location ?? worker.location ?? null, patch.status ?? worker.status, now, id);
+    const updated = this.requireWorker(id);
+    this.ensureWorkerGraphNode(updated, "worker-registry");
+    this.createAuditRecord("system", "worker.update", "worker", id, patch);
+    return updated;
+  }
+
+  listWorkerCapabilities(workerId: string): Capability[] {
+    this.requireWorker(workerId);
+    return this.db
+      .prepare("SELECT * FROM worker_capabilities WHERE worker_id = ? ORDER BY name ASC")
+      .all(workerId)
+      .map(mapWorkerCapability);
+  }
+
+  declareWorkerCapability(workerId: string, input: WorkerCapabilityInput): Capability {
+    return this.upsertWorkerCapability(workerId, input, { preservePolicy: true });
+  }
+
+  upsertWorkerCapability(
+    workerId: string,
+    input: WorkerCapabilityInput,
+    options?: { preservePolicy?: boolean }
+  ): Capability {
+    this.requireWorker(workerId);
+    const now = nowIso();
+    const existing = this.db
+      .prepare("SELECT * FROM worker_capabilities WHERE worker_id = ? AND name = ?")
+      .get(workerId, input.name);
+    const id = existing ? String((existing as Record<string, unknown>).id) : createId("cap");
+    if (existing) {
+      const existingRow = existing as Record<string, unknown>;
+      const preservePolicy = options?.preservePolicy === true;
+      this.db
+        .prepare(
+          `UPDATE worker_capabilities
+           SET risk = ?, read_only = ?, requires_confirmation = ?, allowed_scopes_json = ?,
+               input_schema_json = ?, output_schema_json = ?, enabled = ?, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          preservePolicy ? String(existingRow.risk) : input.risk,
+          input.readOnly ? 1 : 0,
+          preservePolicy ? Number(existingRow.requires_confirmation) : input.requiresConfirmation ? 1 : 0,
+          preservePolicy ? String(existingRow.allowed_scopes_json) : stringify(input.allowedScopes ?? []),
+          stringify(input.inputSchema ?? {}),
+          stringify(input.outputSchema ?? {}),
+          preservePolicy ? Number(existingRow.enabled) : input.enabled ?? true ? 1 : 0,
+          now,
+          id
+        );
+    } else {
+      this.db
+        .prepare(
+          `INSERT INTO worker_capabilities
+           (id, worker_id, name, risk, read_only, requires_confirmation, allowed_scopes_json,
+            input_schema_json, output_schema_json, enabled, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          id,
+          workerId,
+          input.name,
+          input.risk,
+          input.readOnly ? 1 : 0,
+          input.requiresConfirmation ? 1 : 0,
+          stringify(input.allowedScopes ?? []),
+          stringify(input.inputSchema ?? {}),
+          stringify(input.outputSchema ?? {}),
+          input.enabled ?? true ? 1 : 0,
+          now,
+          now
+        );
+    }
+    const capability = mapWorkerCapability(this.db.prepare("SELECT * FROM worker_capabilities WHERE id = ?").get(id) as Record<string, unknown>);
+    this.createWorkerEvent(workerId, undefined, "worker.capability.updated", { name: input.name, enabled: capability.enabled });
+    this.createEvent("worker.capability.updated", "Worker capability updated", { workerId, name: input.name }, { relatedWorkerId: workerId });
+    this.createAuditRecord(
+      options?.preservePolicy ? "worker" : "owner",
+      "worker.capability.updated",
+      "worker",
+      workerId,
+      { workerId, name: input.name, enabled: capability.enabled }
+    );
+    this.ensureWorkerCapabilityGraphNode(workerId, capability);
+    return capability;
+  }
+
+  updateWorkerCapabilityPolicy(workerId: string, capabilityId: string, patch: WorkerCapabilityPolicyPatch): Capability {
+    const capability = this.requireWorkerCapability(capabilityId);
+    if (capability.workerId !== workerId) {
+      throw new Error("Capability does not belong to worker.");
+    }
+    const now = nowIso();
+    this.db
+      .prepare(
+        `UPDATE worker_capabilities
+         SET enabled = ?, risk = ?, requires_confirmation = ?, updated_at = ?
+         WHERE id = ? AND worker_id = ?`
+      )
+      .run(
+        (patch.enabled ?? capability.enabled) ? 1 : 0,
+        patch.risk ?? capability.risk,
+        (patch.requiresConfirmation ?? capability.requiresConfirmation) ? 1 : 0,
+        now,
+        capabilityId,
+        workerId
+      );
+    const updated = this.requireWorkerCapability(capabilityId);
+    this.createWorkerEvent(workerId, undefined, "worker.capability.updated", {
+      capabilityId,
+      name: updated.name,
+      enabled: updated.enabled,
+      risk: updated.risk,
+      requiresConfirmation: updated.requiresConfirmation,
+      source: "owner_policy"
+    });
+    this.createEvent("worker.capability.updated", "Worker capability policy updated", {
+      workerId,
+      capabilityId,
+      name: updated.name
+    }, { relatedWorkerId: workerId });
+    this.createAuditRecord("owner", "worker.capability.policy_update", "worker", workerId, {
+      workerId,
+      capabilityId,
+      name: updated.name,
+      enabled: updated.enabled,
+      risk: updated.risk,
+      requiresConfirmation: updated.requiresConfirmation
+    });
+    this.ensureWorkerCapabilityGraphNode(workerId, updated);
+    return updated;
+  }
+
+  getWorkerPolicy(workerId: string): WorkerPolicySnapshot {
+    this.requireWorker(workerId);
+    return {
+      capabilities: this.listWorkerCapabilities(workerId),
+      pathScopes: this.listWorkerPathScopes(workerId)
+    };
+  }
+
+  listWorkerPathScopes(workerId: string): WorkerPathScope[] {
+    this.requireWorker(workerId);
+    return this.db
+      .prepare("SELECT * FROM worker_path_scopes WHERE worker_id = ? ORDER BY created_at ASC")
+      .all(workerId)
+      .map(mapWorkerPathScope);
+  }
+
+  createWorkerPathScope(workerId: string, input: WorkerPathScopeInput, actor: "owner" | "worker" = "worker"): WorkerPathScope {
+    this.requireWorker(workerId);
+    const now = nowIso();
+    const id = createId("scope");
+    this.db
+      .prepare(
+        `INSERT INTO worker_path_scopes
+         (id, worker_id, label, path, mode, enabled, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(id, workerId, input.label, input.path, input.mode ?? "read_only", input.enabled ?? true ? 1 : 0, now, now);
+    const scope = this.requireWorkerPathScope(id);
+    this.createWorkerEvent(workerId, undefined, "worker.path_scope.updated", { scopeId: scope.id, path: scope.path });
+    this.createEvent("worker.path_scope.updated", "Worker path scope updated", { workerId, scopeId: scope.id, path: scope.path }, { relatedWorkerId: workerId });
+    this.createAuditRecord(actor, "worker.path_scope.created", "worker", workerId, {
+      workerId,
+      scopeId: scope.id,
+      path: scope.path,
+      mode: scope.mode
+    });
+    return scope;
+  }
+
+  updateWorkerPathScope(workerId: string, scopeId: string, patch: WorkerPathScopePatch): WorkerPathScope {
+    const scope = this.requireWorkerPathScope(scopeId);
+    if (scope.workerId !== workerId) {
+      throw new Error("Path scope does not belong to worker.");
+    }
+    const now = nowIso();
+    this.db
+      .prepare(
+        `UPDATE worker_path_scopes
+         SET label = ?, path = ?, mode = ?, enabled = ?, updated_at = ?
+         WHERE id = ? AND worker_id = ?`
+      )
+      .run(
+        patch.label ?? scope.label,
+        patch.path ?? scope.path,
+        patch.mode ?? scope.mode,
+        patch.enabled ?? scope.enabled ? 1 : 0,
+        now,
+        scopeId,
+        workerId
+      );
+    const updated = this.requireWorkerPathScope(scopeId);
+    this.createWorkerEvent(workerId, undefined, "worker.path_scope.updated", {
+      scopeId: updated.id,
+      path: updated.path,
+      enabled: updated.enabled
+    });
+    this.createEvent("worker.path_scope.updated", "Worker path scope updated", {
+      workerId,
+      scopeId: updated.id,
+      path: updated.path
+    }, { relatedWorkerId: workerId });
+    this.createAuditRecord("owner", "worker.path_scope.update", "worker", workerId, {
+      workerId,
+      scopeId: updated.id,
+      path: updated.path,
+      mode: updated.mode,
+      enabled: updated.enabled
+    });
+    return updated;
+  }
+
+  deleteWorkerPathScope(workerId: string, scopeId: string): void {
+    const scope = this.requireWorkerPathScope(scopeId);
+    if (scope.workerId !== workerId) {
+      throw new Error("Path scope does not belong to worker.");
+    }
+    this.db.prepare("DELETE FROM worker_path_scopes WHERE id = ? AND worker_id = ?").run(scopeId, workerId);
+    this.createWorkerEvent(workerId, undefined, "worker.path_scope.updated", { scopeId, path: scope.path, deleted: true });
+    this.createEvent("worker.path_scope.updated", "Worker path scope deleted", {
+      workerId,
+      scopeId,
+      path: scope.path,
+      deleted: true
+    }, { relatedWorkerId: workerId });
+    this.createAuditRecord("owner", "worker.path_scope.delete", "worker", workerId, {
+      workerId,
+      scopeId,
+      path: scope.path
+    });
+  }
+
+  createWorkerJob(input: WorkerJobInput): WorkerJob {
+    const worker = this.requireWorker(input.workerId);
+    if (worker.status === "revoked") {
+      throw new Error("Worker is revoked");
+    }
+    const capability = this.getWorkerCapability(input.workerId, input.capability);
+    if (!capability || !capability.enabled) {
+      throw new Error(`Worker capability is not enabled: ${input.capability}`);
+    }
+    if (!capability.readOnly) {
+      throw new Error(`Worker capability is not read-only: ${input.capability}`);
+    }
+    this.validateWorkerJobInput(input.workerId, input.capability, input.input);
+    const now = nowIso();
+    const job: WorkerJob = {
+      id: createId("job"),
+      workerId: input.workerId,
+      capability: input.capability,
+      input: input.input,
+      status: "queued",
+      timeoutMs: input.timeoutMs ?? 30000,
+      createdAt: now
+    };
+    this.db
+      .prepare(
+        `INSERT INTO worker_jobs
+         (id, worker_id, capability, input_json, status, timeout_ms, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(job.id, job.workerId, job.capability, stringify(job.input), job.status, job.timeoutMs, job.createdAt);
+    this.createWorkerEvent(job.workerId, job.id, "worker.job.created", { capability: job.capability });
+    this.createEvent("worker.job.created", "Worker job created", {
+      workerId: job.workerId,
+      jobId: job.id,
+      capability: job.capability
+    }, { relatedWorkerId: job.workerId });
+    this.createAuditRecord("system", "worker.job.create", "worker_job", job.id, {
+      workerId: job.workerId,
+      capability: job.capability
+    });
+    return job;
+  }
+
+  listWorkerJobs(filter: { workerId?: string; status?: WorkerJobStatus } = {}): WorkerJob[] {
+    if (filter.workerId && filter.status) {
+      return this.db
+        .prepare("SELECT * FROM worker_jobs WHERE worker_id = ? AND status = ? ORDER BY created_at ASC")
+        .all(filter.workerId, filter.status)
+        .map(mapWorkerJob);
+    }
+    if (filter.workerId) {
+      return this.db
+        .prepare("SELECT * FROM worker_jobs WHERE worker_id = ? ORDER BY created_at DESC")
+        .all(filter.workerId)
+        .map(mapWorkerJob);
+    }
+    return this.db.prepare("SELECT * FROM worker_jobs ORDER BY created_at DESC").all().map(mapWorkerJob);
+  }
+
+  startWorkerJob(workerId: string, jobId: string): WorkerJob {
+    const job = this.requireWorkerJob(jobId);
+    if (job.workerId !== workerId) {
+      throw new Error("Worker job does not belong to worker");
+    }
+    if (job.status !== "queued") {
+      return job;
+    }
+    const now = nowIso();
+    this.db.prepare("UPDATE worker_jobs SET status = ?, started_at = ? WHERE id = ?").run("running", now, jobId);
+    this.createWorkerEvent(workerId, jobId, "worker.job.started", { capability: job.capability });
+    this.createEvent("worker.job.started", "Worker job started", { workerId, jobId, capability: job.capability }, { relatedWorkerId: workerId });
+    this.createAuditRecord("worker", "worker.job.start", "worker_job", jobId, { workerId, capability: job.capability });
+    return this.requireWorkerJob(jobId);
+  }
+
+  completeWorkerJob(workerId: string, jobId: string, result: JsonRecord): WorkerJob {
+    const job = this.requireWorkerJob(jobId);
+    if (job.workerId !== workerId) {
+      throw new Error("Worker job does not belong to worker");
+    }
+    const now = nowIso();
+    this.db
+      .prepare("UPDATE worker_jobs SET status = ?, result_json = ?, completed_at = ? WHERE id = ?")
+      .run("completed", stringify(result), now, jobId);
+    this.createWorkerEvent(workerId, jobId, "worker.job.completed", { capability: job.capability, result });
+    this.createEvent("worker.job.completed", "Worker job completed", { workerId, jobId, capability: job.capability, result }, { relatedWorkerId: workerId });
+    this.createAuditRecord("worker", "worker.job.complete", "worker_job", jobId, {
+      workerId,
+      capability: job.capability,
+      resultSize: JSON.stringify(result).length
+    });
+    return this.requireWorkerJob(jobId);
+  }
+
+  failWorkerJob(workerId: string, jobId: string, error: string): WorkerJob {
+    const job = this.requireWorkerJob(jobId);
+    if (job.workerId !== workerId) {
+      throw new Error("Worker job does not belong to worker");
+    }
+    const now = nowIso();
+    this.db
+      .prepare("UPDATE worker_jobs SET status = ?, error = ?, completed_at = ? WHERE id = ?")
+      .run("failed", error, now, jobId);
+    this.createWorkerEvent(workerId, jobId, "worker.job.failed", { capability: job.capability, error });
+    this.createEvent("worker.job.failed", "Worker job failed", { workerId, jobId, capability: job.capability, error }, { relatedWorkerId: workerId });
+    this.createAuditRecord("worker", "worker.job.fail", "worker_job", jobId, {
+      workerId,
+      capability: job.capability,
+      error
+    });
+    return this.requireWorkerJob(jobId);
   }
 
   listAuditRecords(): AuditRecord[] {
@@ -913,6 +1824,18 @@ export class MemoryStore {
     return this.updateMcpServer(id, { enabled: false, status: "disabled" });
   }
 
+  removeMcpServer(id: string): McpServer {
+    const server = this.requireMcpServer(id);
+    this.db.prepare("DELETE FROM tool_registry WHERE source = 'mcp' AND source_id IN (SELECT id FROM mcp_tools WHERE server_id = ?)").run(id);
+    this.db.prepare("DELETE FROM mcp_servers WHERE id = ?").run(id);
+    this.createEvent("mcp.server.removed", "MCP server removed", { serverId: id, name: server.name });
+    this.createAuditRecord("owner", "mcp.server.removed", "mcp_server", id, {
+      name: server.name,
+      transport: server.transport
+    });
+    return server;
+  }
+
   recordMcpConnection(id: string, ok: boolean, message: string): McpServer {
     const current = this.requireMcpServer(id);
     const now = nowIso();
@@ -1009,17 +1932,23 @@ export class MemoryStore {
     return this.db.prepare("SELECT * FROM skill_definitions ORDER BY source_type ASC, name ASC").all().map(mapSkillDefinition);
   }
 
-  createSkill(input: SkillDefinitionInput): SkillDefinition {
+  getSkillByName(name: string): SkillDefinition | undefined {
+    const row = this.db.prepare("SELECT * FROM skill_definitions WHERE name = ?").get(name);
+    return row ? mapSkillDefinition(row) : undefined;
+  }
+
+  createSkill(input: SkillDefinitionInput, options?: { imported?: boolean }): SkillDefinition {
     const now = nowIso();
     const skill: SkillDefinition = {
       id: createId("skill"),
       name: input.name,
       description: input.description,
-      sourceType: input.sourceType ?? "local",
+      sourceType: input.sourceType ?? (options?.imported ? "imported" : "local"),
       instructionMarkdown: input.instructionMarkdown,
       requiredTools: input.requiredTools ?? [],
       riskLevel: input.riskLevel ?? "low",
       enabled: input.enabled ?? true,
+      storagePath: input.storagePath,
       createdAt: now,
       updatedAt: now
     };
@@ -1037,13 +1966,67 @@ export class MemoryStore {
       requiresConfirmation: skill.riskLevel !== "low",
       enabled: skill.enabled
     });
-    this.createEvent("skill.created", "Skill created", { skillId: skill.id, name: skill.name });
-    this.createAuditRecord("owner", "skill.created", "skill", skill.id, {
+    const eventType = options?.imported ? "skill.imported" : "skill.created";
+    const auditAction = options?.imported ? "skill.imported" : "skill.created";
+    this.createEvent(eventType, options?.imported ? "Skill imported" : "Skill created", { skillId: skill.id, name: skill.name });
+    this.createAuditRecord("owner", auditAction, "skill", skill.id, {
       name: skill.name,
       sourceType: skill.sourceType,
-      riskLevel: skill.riskLevel
+      riskLevel: skill.riskLevel,
+      storagePath: skill.storagePath
     });
     return skill;
+  }
+
+  upsertImportedSkill(input: SkillDefinitionInput & { storagePath: string }): SkillDefinition {
+    const existing = this.getSkillByName(input.name);
+    if (!existing) {
+      return this.createSkill({
+        ...input,
+        sourceType: "imported",
+        enabled: input.enabled ?? true
+      }, { imported: true });
+    }
+
+    const now = nowIso();
+    const next: SkillDefinition = {
+      ...existing,
+      description: input.description,
+      sourceType: "imported",
+      instructionMarkdown: input.instructionMarkdown,
+      requiredTools: input.requiredTools ?? [],
+      riskLevel: input.riskLevel ?? existing.riskLevel,
+      storagePath: input.storagePath,
+      updatedAt: now
+    };
+    this.db
+      .prepare(
+        `UPDATE skill_definitions
+         SET description = ?, source_type = ?, instruction_markdown = ?, required_tools_json = ?, risk_level = ?, storage_path = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(
+        next.description,
+        next.sourceType,
+        next.instructionMarkdown,
+        stringify(next.requiredTools),
+        next.riskLevel,
+        next.storagePath ?? null,
+        next.updatedAt,
+        existing.id
+      );
+    this.updateToolPolicy(`tool_skill_${existing.id}`, {
+      riskLevel: next.riskLevel,
+      requiresConfirmation: next.riskLevel !== "low",
+      enabled: next.enabled
+    });
+    this.createEvent("skill.imported", "Skill imported", { skillId: existing.id, name: next.name });
+    this.createAuditRecord("owner", "skill.imported", "skill", existing.id, {
+      name: next.name,
+      sourceType: next.sourceType,
+      storagePath: next.storagePath
+    });
+    return this.requireSkill(existing.id);
   }
 
   updateSkill(id: string, patch: Partial<Pick<SkillDefinition, "description" | "instructionMarkdown" | "requiredTools" | "riskLevel" | "enabled">>): SkillDefinition {
@@ -1081,7 +2064,15 @@ export class MemoryStore {
 
   deleteSkill(id: string): SkillDefinition {
     const skill = this.requireSkill(id);
-    this.updateSkill(id, { enabled: false });
+    this.db.prepare("DELETE FROM skill_runs WHERE skill_id = ?").run(id);
+    this.db.prepare("DELETE FROM tool_registry WHERE source = 'skill' AND source_id = ?").run(id);
+    this.db.prepare("DELETE FROM skill_definitions WHERE id = ?").run(id);
+    this.createEvent("skill.removed", "Skill removed", { skillId: id, name: skill.name });
+    this.createAuditRecord("owner", "skill.removed", "skill", id, {
+      name: skill.name,
+      sourceType: skill.sourceType,
+      storagePath: skill.storagePath
+    });
     return skill;
   }
 
@@ -1136,8 +2127,9 @@ export class MemoryStore {
     return message;
   }
 
-  private extractMemories(content: string): ExtractedMemory[] {
+  private extractDeterministicMemories(content: string): ExtractedMemory[] {
     const memories: ExtractedMemory[] = [];
+
     const preferenceMatch = content.match(/\bprefer(?:s|red|ring)?\s+([^.!?]+)/i);
     if (preferenceMatch?.[1]) {
       const value = cleanPhrase(preferenceMatch[1]);
@@ -1174,17 +2166,6 @@ export class MemoryStore {
         payload: { value },
         confidence: 0.88,
         risk: "high"
-      });
-    }
-
-    if (memories.length === 0 && content.trim()) {
-      memories.push({
-        kind: "observation",
-        label: content.trim().slice(0, 120),
-        proposedNodeType: "observation",
-        payload: { value: content.trim() },
-        confidence: 0.5,
-        risk: "medium"
       });
     }
 
@@ -1278,6 +2259,23 @@ export class MemoryStore {
     }
 
     return candidate;
+  }
+
+  createMemoryCandidatesFromMessage(message: Message, extractedMemories: ExtractedMemory[] = []): MemoryCandidate[] {
+    const memories = mergeExtractedMemories([
+      ...extractedMemories,
+      ...this.extractDeterministicMemories(message.content).map((memory) => ({
+        ...memory,
+        locale: memory.locale ?? message.locale
+      }))
+    ]);
+    const candidates: MemoryCandidate[] = [];
+    for (const memory of memories) {
+      if (!this.hasEquivalentMemoryCandidate(memory)) {
+        candidates.push(this.createMemoryCandidate(memory, message));
+      }
+    }
+    return candidates;
   }
 
   private promoteCandidateToGraph(candidate: MemoryCandidate): void {
@@ -1482,35 +2480,26 @@ export class MemoryStore {
     }
   }
 
-  private ensureDefaultLlmProviderAndRoutes(): void {
+  private removeProductMockLlmProvider(): void {
+    this.db.prepare("DELETE FROM llm_model_routes WHERE provider_config_id IN (SELECT id FROM llm_provider_configs WHERE adapter_type = 'mock' OR preset_id = 'mock')").run();
+    this.db.prepare("DELETE FROM llm_provider_configs WHERE adapter_type = 'mock' OR preset_id = 'mock'").run();
+    this.db.prepare("DELETE FROM llm_provider_presets WHERE id = 'mock' OR adapter_type = 'mock'").run();
+  }
+
+  private ensureRoutesForFirstProvider(providerConfigId: string, model: string): void {
+    if (this.listLlmModelRoutes().length > 0) {
+      return;
+    }
     const now = nowIso();
-    this.db
-      .prepare(
-        `INSERT OR IGNORE INTO llm_provider_configs
-         (id, preset_id, display_name, adapter_type, base_url, api_key_secret, default_model, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        DEFAULT_MOCK_PROVIDER_ID,
-        "mock",
-        "Mock",
-        "mock",
-        null,
-        null,
-        "mock-deterministic",
-        1,
-        now,
-        now
-      );
     for (const purpose of LLM_ROUTE_PURPOSES) {
-      const maxTokens = purpose === "memory_extraction" ? 2000 : 1200;
+      const maxTokens = purpose === "memory_extraction" ? 2000 : 16384;
       this.db
         .prepare(
           `INSERT OR IGNORE INTO llm_model_routes
            (purpose, provider_config_id, model, temperature, max_tokens, enabled, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)`
         )
-        .run(purpose, DEFAULT_MOCK_PROVIDER_ID, "mock-deterministic", 0.2, maxTokens, 1, now);
+        .run(purpose, providerConfigId, model, purpose === "memory_extraction" ? 0 : 0.2, maxTokens, 1, now);
     }
   }
 
@@ -1541,6 +2530,46 @@ export class MemoryStore {
         riskLevel: "low",
         requiresConfirmation: false,
         enabled: true
+      },
+      {
+        id: "tool_internal_web_search",
+        source: "internal",
+        sourceId: "web.search",
+        name: "web.search",
+        title: "Web search",
+        description: "Search the public web for current information and return ranked results with URLs and snippets.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: { type: "string" },
+            max_results: { type: "number" }
+          },
+          required: ["query"]
+        },
+        outputSchema: { type: "object" },
+        riskLevel: "low",
+        requiresConfirmation: false,
+        enabled: true
+      },
+      {
+        id: "tool_internal_web_fetch",
+        source: "internal",
+        sourceId: "web.fetch",
+        name: "web.fetch",
+        title: "Web fetch",
+        description: "Fetch readable text content from a public HTTP or HTTPS URL.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            url: { type: "string" },
+            max_chars: { type: "number" }
+          },
+          required: ["url"]
+        },
+        outputSchema: { type: "object" },
+        riskLevel: "medium",
+        requiresConfirmation: false,
+        enabled: true
       }
     ];
     for (const tool of internalTools) {
@@ -1548,32 +2577,41 @@ export class MemoryStore {
     }
   }
 
-  private ensureBuiltInSkills(): void {
-    const builtIns: SkillDefinition[] = [
-      builtInSkill("onboarding", "Help Sedna learn the owner's goals, constraints, tools, and preferred working style.", ["suggest_action"]),
-      builtInSkill("memory-review", "Review candidate memories and prepare safe approval or quarantine recommendations.", ["suggest_action"]),
-      builtInSkill("planning", "Turn owner goals into tasks and next actions.", ["task.create", "suggest_action"]),
-      builtInSkill("resource-learning", "Extract reusable insights, methods, and resources from owner-provided material.", ["suggest_action"]),
-      builtInSkill("code-review-method", "Apply a structured code-review workflow focused on defects, tests, and risks.", ["suggest_action"])
-    ];
-    for (const skill of builtIns) {
-      const existing = this.db.prepare("SELECT id FROM skill_definitions WHERE id = ?").get(skill.id);
-      if (!existing) {
-        this.insertSkill(skill);
-      }
-      this.upsertToolRegistryEntry({
-        id: `tool_skill_${skill.id}`,
-        source: "skill",
-        sourceId: skill.id,
-        name: `skill.${skill.name}`,
-        title: skill.name,
-        description: skill.description,
-        inputSchema: { type: "object" },
-        outputSchema: { type: "object" },
-        riskLevel: skill.riskLevel,
-        requiresConfirmation: false,
-        enabled: skill.enabled
-      });
+  private removeLegacyBuiltInSkills(): void {
+    const builtIns = this.db
+      .prepare("SELECT id FROM skill_definitions WHERE source_type = 'built_in'")
+      .all() as Array<{ id: string }>;
+    for (const row of builtIns) {
+      const skillId = String(row.id);
+      this.db.prepare("DELETE FROM skill_runs WHERE skill_id = ?").run(skillId);
+      this.db.prepare("DELETE FROM tool_registry WHERE source = 'skill' AND source_id = ?").run(skillId);
+      this.db.prepare("DELETE FROM skill_definitions WHERE id = ?").run(skillId);
+    }
+  }
+
+  private removeLegacyBailianWebSearchMcpServers(): void {
+    const legacyServers = this.db
+      .prepare(
+        `SELECT id FROM mcp_servers
+         WHERE name = 'Bailian WebSearch'
+            OR url LIKE '%/mcps/WebSearch/mcp'`
+      )
+      .all() as Array<{ id: string }>;
+    for (const row of legacyServers) {
+      this.removeMcpServer(String(row.id));
+    }
+  }
+
+  private removeLegacyMockMcpServers(): void {
+    const mockServers = this.db
+      .prepare(
+        `SELECT id FROM mcp_servers
+         WHERE lower(name) LIKE '%mock%'
+            OR command IN ('mock', 'mock-stdio')`
+      )
+      .all() as Array<{ id: string }>;
+    for (const row of mockServers) {
+      this.removeMcpServer(String(row.id));
     }
   }
 
@@ -1581,8 +2619,8 @@ export class MemoryStore {
     this.db
       .prepare(
         `INSERT INTO skill_definitions
-         (id, name, description, source_type, instruction_markdown, required_tools_json, risk_level, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         (id, name, description, source_type, instruction_markdown, required_tools_json, risk_level, enabled, storage_path, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         skill.id,
@@ -1593,6 +2631,7 @@ export class MemoryStore {
         stringify(skill.requiredTools),
         skill.riskLevel,
         skill.enabled ? 1 : 0,
+        skill.storagePath ?? null,
         skill.createdAt,
         skill.updatedAt
       );
@@ -1604,6 +2643,7 @@ export class MemoryStore {
     const existingTool = existing ? mapMcpTool(existing) : undefined;
     const riskLevel = tool.riskLevel ?? existingTool?.riskLevel ?? inferToolRisk(tool.name, tool.description ?? "");
     const requiresConfirmation = server.trustLevel === "untrusted" || riskLevel !== "low";
+    const enabled = existingTool?.enabled ?? true;
     this.db
       .prepare(
         `INSERT INTO mcp_tools
@@ -1627,7 +2667,7 @@ export class MemoryStore {
         stringify(tool.inputSchema ?? {}),
         stringify(tool.outputSchema ?? {}),
         riskLevel,
-        existingTool?.enabled ?? true ? 1 : 0,
+        enabled ? 1 : 0,
         requiresConfirmation ? 1 : 0,
         lastSeenAt
       );
@@ -1718,6 +2758,69 @@ export class MemoryStore {
     const now = nowIso();
     this.upsertSettingIfMissing("ui.locale", "en", now);
     this.upsertSettingIfMissing("assistant.reply_locale", "follow_ui", now);
+    this.ensureDefaultWebToolsSettings();
+  }
+
+  private ensureDefaultWebToolsSettings(): void {
+    const now = nowIso();
+    const env = process.env;
+    const braveApiKey = env.BRAVE_SEARCH_API_KEY?.trim() || undefined;
+    const dashscopeApiKey = env.DASHSCOPE_API_KEY?.trim() || undefined;
+    const searxngUrl = env.SEARXNG_URL?.trim() || undefined;
+    const explicitProvider = env.WEB_SEARCH_PROVIDER?.trim().toLowerCase();
+    let initialProvider: WebSearchProvider = "duckduckgo";
+    if (explicitProvider === "brave" || explicitProvider === "searxng" || explicitProvider === "duckduckgo" || explicitProvider === "bailian") {
+      initialProvider = explicitProvider;
+    } else if (dashscopeApiKey) {
+      initialProvider = "bailian";
+    } else if (braveApiKey) {
+      initialProvider = "brave";
+    } else if (searxngUrl) {
+      initialProvider = "searxng";
+    }
+    this.upsertSettingIfMissing("web.tools.enabled", (env.WEB_TOOLS_ENABLED ?? "true") !== "false", now);
+    this.upsertSettingIfMissing("web.search.provider", initialProvider, now);
+    this.upsertSettingIfMissing("web.search.max_results", Number.parseInt(env.WEB_SEARCH_MAX_RESULTS ?? "5", 10) || 5, now);
+    this.upsertSettingIfMissing("web.fetch.max_chars", Number.parseInt(env.WEB_FETCH_MAX_CHARS ?? "8000", 10) || 8000, now);
+    this.upsertSettingIfMissing("web.fetch.timeout_ms", Number.parseInt(env.WEB_FETCH_TIMEOUT_MS ?? "15000", 10) || 15000, now);
+    this.upsertSettingIfMissing("web.searxng.url", searxngUrl ?? null, now);
+    if (braveApiKey) {
+      this.upsertSettingIfMissing("web.brave.api_key_secret", braveApiKey, now);
+    }
+    if (dashscopeApiKey) {
+      this.upsertSettingIfMissing("web.dashscope.api_key_secret", dashscopeApiKey, now);
+    }
+  }
+
+  private getWebToolsSettingsWithSecrets(): WebToolsConfig & { updatedAt: string } {
+    this.ensureDefaultWebToolsSettings();
+    const rows = this.db.prepare("SELECT key, value_json, updated_at FROM settings WHERE key LIKE 'web.%'").all();
+    const values = new Map(rows.map((row) => [String(row.key), parseJson<unknown>(row.value_json, null)]));
+    const updatedAt = rows
+      .map((row) => String(row.updated_at))
+      .sort()
+      .at(-1) ?? nowIso();
+    const searchMaxResults = normalizeBoundedInt(values.get("web.search.max_results"), 5, 1, 10);
+    const fetchMaxChars = normalizeBoundedInt(values.get("web.fetch.max_chars"), 8000, 1000, 50000);
+    const fetchTimeoutMs = normalizeBoundedInt(values.get("web.fetch.timeout_ms"), 15000, 1000, 60000);
+    const searchProvider = normalizeWebSearchProvider(values.get("web.search.provider"));
+    const searxngUrlRaw = values.get("web.searxng.url");
+    const searxngUrl = typeof searxngUrlRaw === "string" && searxngUrlRaw.trim().length > 0 ? searxngUrlRaw.trim() : undefined;
+    const braveApiKeyRaw = values.get("web.brave.api_key_secret");
+    const braveApiKey = typeof braveApiKeyRaw === "string" && braveApiKeyRaw.length > 0 ? braveApiKeyRaw : undefined;
+    const dashscopeApiKeyRaw = values.get("web.dashscope.api_key_secret");
+    const dashscopeApiKey = typeof dashscopeApiKeyRaw === "string" && dashscopeApiKeyRaw.length > 0 ? dashscopeApiKeyRaw : undefined;
+    return {
+      enabled: values.get("web.tools.enabled") !== false,
+      searchProvider,
+      searchMaxResults,
+      fetchMaxChars,
+      fetchTimeoutMs,
+      searxngUrl,
+      braveApiKey,
+      dashscopeApiKey,
+      updatedAt
+    };
   }
 
   private upsertSettingIfMissing(key: string, value: unknown, updatedAt: string): void {
@@ -1745,12 +2848,611 @@ export class MemoryStore {
     }
   }
 
+  private requireWorker(id: string): Worker {
+    const worker = this.getWorker(id);
+    if (!worker) {
+      throw new Error(`Worker not found: ${id}`);
+    }
+    return worker;
+  }
+
+  private markWorkerGraphRevoked(workerId: string, displayName: string, worker: Worker): void {
+    const now = nowIso();
+    const workerNodeId = `node_${workerId}`;
+    const payload = {
+      environment: worker.environment,
+      hostName: worker.hostName,
+      os: worker.os,
+      location: worker.location,
+      status: worker.status
+    };
+    if (this.getGraphNode(workerNodeId)) {
+      this.db
+        .prepare("UPDATE nodes SET label = ?, payload_json = ?, status = ?, updated_at = ? WHERE id = ?")
+        .run(displayName, stringify(payload), "rejected", now, workerNodeId);
+    } else {
+      this.insertNode({
+        id: workerNodeId,
+        type: "worker",
+        label: displayName,
+        payload,
+        status: "rejected",
+        confidence: 1,
+        scopeType: "worker",
+        scopeId: workerId,
+        origin: "worker-registry",
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+    for (const capability of this.listWorkerCapabilities(workerId)) {
+      const capabilityNodeId = `node_${capability.id}`;
+      if (this.getGraphNode(capabilityNodeId)) {
+        this.db
+          .prepare("UPDATE nodes SET label = ?, payload_json = ?, status = ?, updated_at = ? WHERE id = ?")
+          .run(capability.name, stringify({ ...capability, enabled: false }), "rejected", now, capabilityNodeId);
+      }
+    }
+  }
+
+  private ensureWorkerGraphNode(worker: Worker, origin: string): void {
+    const now = nowIso();
+    const workerNodeId = `node_${worker.id}`;
+    const payload = {
+      environment: worker.environment,
+      hostName: worker.hostName,
+      os: worker.os,
+      location: worker.location,
+      status: worker.status
+    };
+    if (this.getGraphNode(workerNodeId)) {
+      this.db
+        .prepare("UPDATE nodes SET label = ?, payload_json = ?, status = ?, updated_at = ? WHERE id = ?")
+        .run(worker.displayName, stringify(payload), worker.status === "revoked" ? "rejected" : "active", now, workerNodeId);
+      return;
+    }
+    this.insertNode({
+      id: workerNodeId,
+      type: "worker",
+      label: worker.displayName,
+      payload,
+      status: worker.status === "revoked" ? "rejected" : "active",
+      confidence: 1,
+      scopeType: "worker",
+      scopeId: worker.id,
+      origin,
+      createdAt: now,
+      updatedAt: now
+    });
+  }
+
+  private getWorkerCapability(workerId: string, name: string): Capability | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM worker_capabilities WHERE worker_id = ? AND name = ?")
+      .get(workerId, name);
+    return row ? mapWorkerCapability(row as Record<string, unknown>) : undefined;
+  }
+
+  private requireWorkerCapability(id: string): Capability {
+    const row = this.db.prepare("SELECT * FROM worker_capabilities WHERE id = ?").get(id);
+    if (!row) {
+      throw new Error(`Worker capability not found: ${id}`);
+    }
+    return mapWorkerCapability(row as Record<string, unknown>);
+  }
+
+  private ensureWorkerCapabilityGraphNode(workerId: string, capability: Capability): void {
+    const now = nowIso();
+    const capabilityNodeId = `node_${capability.id}`;
+    if (this.getGraphNode(capabilityNodeId)) {
+      this.db
+        .prepare("UPDATE nodes SET label = ?, payload_json = ?, status = ?, updated_at = ? WHERE id = ?")
+        .run(capability.name, stringify(capability), capability.enabled ? "active" : "rejected", now, capabilityNodeId);
+      return;
+    }
+    this.insertNode({
+      id: capabilityNodeId,
+      type: "capability",
+      label: capability.name,
+      payload: capability,
+      status: capability.enabled ? "active" : "rejected",
+      confidence: 1,
+      scopeType: "worker",
+      scopeId: workerId,
+      origin: "worker-registry",
+      createdAt: now,
+      updatedAt: now
+    });
+    this.insertEdge(`node_${workerId}`, "declares_capability", capabilityNodeId, {}, "worker", workerId, 1);
+  }
+
+  private requireWorkerPathScope(id: string): WorkerPathScope {
+    const row = this.db.prepare("SELECT * FROM worker_path_scopes WHERE id = ?").get(id);
+    if (!row) {
+      throw new Error(`Worker path scope not found: ${id}`);
+    }
+    return mapWorkerPathScope(row as Record<string, unknown>);
+  }
+
+  private requireWorkerJob(id: string): WorkerJob {
+    const row = this.db.prepare("SELECT * FROM worker_jobs WHERE id = ?").get(id);
+    if (!row) {
+      throw new Error(`Worker job not found: ${id}`);
+    }
+    return mapWorkerJob(row as Record<string, unknown>);
+  }
+
+  private validateWorkerJobInput(workerId: string, capability: string, input: JsonRecord): void {
+    if (capability === "worker.status") {
+      return;
+    }
+    if (capability === "file.search") {
+      const paths = Array.isArray(input.paths) ? input.paths.map(String) : [];
+      if (paths.length === 0) {
+        throw new Error("file.search requires at least one path.");
+      }
+      for (const path of paths) {
+        this.assertWorkerPathAllowed(workerId, path);
+      }
+      return;
+    }
+    if (capability === "file.list") {
+      if (typeof input.path !== "string") {
+        throw new Error("file.list requires a path.");
+      }
+      this.assertWorkerPathAllowed(workerId, input.path);
+      return;
+    }
+    if (capability === "file.read") {
+      if (typeof input.path !== "string") {
+        throw new Error("file.read requires a path.");
+      }
+      this.assertWorkerPathAllowed(workerId, input.path);
+      return;
+    }
+    throw new Error(`Unsupported worker capability: ${capability}`);
+  }
+
+  private assertWorkerPathAllowed(workerId: string, targetPath: string): void {
+    if (isForbiddenWorkerPath(targetPath)) {
+      throw new Error("Worker job path is forbidden.");
+    }
+    const scopes = this.listWorkerPathScopes(workerId).filter((scope) => scope.enabled && scope.mode === "read_only");
+    if (!scopes.some((scope) => isPathWithinScope(targetPath, scope.path))) {
+      throw new Error("Worker job path is outside allowed scopes.");
+    }
+  }
+
+  private registerWorkerWithCredential(input: RegisterWorkerInput, credentialHash: string): Worker {
+    const worker = this.registerWorker(input);
+    this.db.prepare("UPDATE workers SET credential_hash = ? WHERE id = ?").run(credentialHash, worker.id);
+    return this.requireWorker(worker.id);
+  }
+
+  private expireWorkerPairCodes(): void {
+    const now = nowIso();
+    this.db
+      .prepare("UPDATE worker_pair_codes SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?")
+      .run(now);
+  }
+
+  private markStaleWorkersOffline(): void {
+    const cutoff = new Date(Date.now() - WORKER_OFFLINE_AFTER_MS).toISOString();
+    const staleWorkers = this.db
+      .prepare("SELECT id FROM workers WHERE status = 'online' AND last_seen_at IS NOT NULL AND last_seen_at < ?")
+      .all(cutoff) as Array<{ id: string }>;
+    if (staleWorkers.length === 0) {
+      return;
+    }
+    const now = nowIso();
+    const update = this.db.prepare("UPDATE workers SET status = 'offline', updated_at = ? WHERE id = ? AND status = 'online'");
+    for (const worker of staleWorkers) {
+      const result = update.run(now, worker.id);
+      if (result.changes === 0) {
+        continue;
+      }
+      this.createWorkerEvent(worker.id, undefined, "worker.offline", { reason: "heartbeat_timeout" });
+      this.createEvent("worker.offline", "Worker offline", { workerId: worker.id, reason: "heartbeat_timeout" }, { relatedWorkerId: worker.id });
+      this.createAuditRecord("system", "worker.offline", "worker", worker.id, { reason: "heartbeat_timeout" });
+    }
+  }
+
+  private createWorkerEvent(workerId: string, jobId: string | undefined, type: string, payload: JsonRecord): WorkerEvent {
+    const event: WorkerEvent = {
+      id: createId("worker_event"),
+      workerId,
+      jobId,
+      type,
+      payload,
+      createdAt: nowIso()
+    };
+    this.db
+      .prepare(
+        `INSERT INTO worker_events (id, worker_id, job_id, type, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(event.id, event.workerId, event.jobId ?? null, event.type, stringify(event.payload), event.createdAt);
+    return event;
+  }
+
   private requireMemoryCandidate(id: string): MemoryCandidate {
     const row = this.db.prepare("SELECT * FROM memory_candidates WHERE id = ?").get(id);
     if (!row) {
       throw new Error(`Memory candidate not found: ${id}`);
     }
     return mapMemoryCandidate(row);
+  }
+
+  private hasEquivalentMemoryCandidate(memory: ExtractedMemory): boolean {
+    return this.listMemoryCandidates().some((candidate) => candidateKey(candidate) === extractedMemoryKey(memory));
+  }
+
+  private deduplicateMemoryCandidates(): number {
+    const groups = new Map<string, MemoryCandidate[]>();
+    for (const candidate of this.listMemoryCandidates()) {
+      const key = candidateKey(candidate);
+      groups.set(key, [...(groups.get(key) ?? []), candidate]);
+    }
+
+    let deleted = 0;
+    for (const candidates of groups.values()) {
+      if (candidates.length < 2) {
+        continue;
+      }
+      const keeper = chooseMemoryCandidateToKeep(candidates);
+      for (const candidate of candidates) {
+        if (candidate.id !== keeper.id) {
+          this.deleteDuplicateMemoryCandidate(candidate);
+          deleted += 1;
+        }
+      }
+    }
+    return deleted;
+  }
+
+  private deleteDuplicateMemoryCandidate(candidate: MemoryCandidate): void {
+    const nodeId = `node_${candidate.id}`;
+    this.db.prepare("DELETE FROM edges WHERE source_node_id = ? OR target_node_id = ?").run(nodeId, nodeId);
+    this.db.prepare("DELETE FROM nodes WHERE id = ?").run(nodeId);
+    for (const evidenceId of candidate.evidenceIds) {
+      this.db.prepare("DELETE FROM evidence WHERE id = ?").run(evidenceId);
+    }
+    this.db.prepare("DELETE FROM memory_candidates WHERE id = ?").run(candidate.id);
+  }
+
+  private migrateProfileAttributeHistoryForeignKey(): void {
+    const row = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'profile_attribute_history'")
+      .get() as { sql?: string } | undefined;
+    if (!row?.sql || !row.sql.includes("REFERENCES profile_attributes")) {
+      return;
+    }
+    this.db.exec(`
+      CREATE TABLE profile_attribute_history_next (
+        id TEXT PRIMARY KEY,
+        attribute_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+        operation TEXT NOT NULL,
+        old_value_json TEXT,
+        new_value_json TEXT,
+        evidence_id TEXT,
+        reason TEXT,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO profile_attribute_history_next SELECT * FROM profile_attribute_history;
+      DROP TABLE profile_attribute_history;
+      ALTER TABLE profile_attribute_history_next RENAME TO profile_attribute_history;
+    `);
+  }
+
+  private ensureOwnerProfile(): void {
+    const now = nowIso();
+    this.db
+      .prepare(
+        "INSERT OR IGNORE INTO profiles (id, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?)"
+      )
+      .run(DEFAULT_OWNER_PROFILE_ID, "owner", now, now);
+    this.ensureOwnerNode();
+    if (!this.getGraphNode(DEFAULT_OWNER_PROFILE_ID)) {
+      this.insertNode({
+        id: DEFAULT_OWNER_PROFILE_ID,
+        type: "owner_profile",
+        label: "Owner Profile",
+        payload: { ownerId: "owner" },
+        status: "active",
+        confidence: 1,
+        scopeType: "profile",
+        origin: "system",
+        createdAt: now,
+        updatedAt: now
+      });
+      this.insertEdge(DEFAULT_OWNER_NODE_ID, "has_profile", DEFAULT_OWNER_PROFILE_ID, {}, "profile", undefined, 1);
+    }
+    this.migrateProfileAttributesToGraph();
+    this.importLegacyProfileFactCandidates();
+  }
+
+  private touchOwnerProfile(updatedAt: string): void {
+    this.db.prepare("UPDATE profiles SET updated_at = ? WHERE id = ?").run(updatedAt, DEFAULT_OWNER_PROFILE_ID);
+    this.db.prepare("UPDATE nodes SET updated_at = ? WHERE id = ?").run(updatedAt, DEFAULT_OWNER_PROFILE_ID);
+  }
+
+  private findProfileAttribute(key: string): ProfileAttribute | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM nodes
+         WHERE type = 'profile_attribute'
+           AND scope_id = ?
+           AND json_extract(payload_json, '$.attributeKey') = ?
+         ORDER BY updated_at DESC
+         LIMIT 1`
+      )
+      .get(DEFAULT_OWNER_PROFILE_ID, key);
+    return row ? profileAttributeFromNode(mapGraphNode(row)) : undefined;
+  }
+
+  private requireProfileAttribute(id: string): ProfileAttribute {
+    const node = this.getGraphNode(id);
+    if (!node || node.type !== "profile_attribute") {
+      throw new Error(`Profile attribute not found: ${id}`);
+    }
+    return profileAttributeFromNode(node);
+  }
+
+  private insertProfileAttribute(
+    proposal: ProfilePatchProposal,
+    evidenceId: string,
+    status: MemoryStatus,
+    requiresConfirmation: boolean
+  ): ProfileAttribute {
+    const now = nowIso();
+    const id = createId("profile_attr");
+    const node = buildProfileAttributeNode({
+      id,
+      proposal,
+      evidenceId,
+      status,
+      requiresConfirmation,
+      createdAt: now,
+      updatedAt: now
+    });
+    this.insertNode(node);
+    this.ensureProfileAttributeEdge(id, proposal.attributeKey, proposal.confidence, node.createdAt, node.updatedAt);
+    return this.requireProfileAttribute(id);
+  }
+
+  private updateProfileAttributeNode(
+    id: string,
+    patch: {
+      semanticType?: ProfileSemanticType;
+      value?: JsonRecord;
+      normalizedValue?: string;
+      confidence?: number;
+      risk?: RiskLevel;
+      status?: MemoryStatus;
+      latestEvidenceId?: string;
+      requiresConfirmation?: boolean;
+      updatedAt: string;
+    }
+  ): void {
+    const existing = this.getGraphNode(id);
+    if (!existing || existing.type !== "profile_attribute") {
+      throw new Error(`Profile attribute not found: ${id}`);
+    }
+    const attributeKey = String(existing.payload.attributeKey ?? "");
+    const normalizedValue = patch.normalizedValue ?? String(existing.payload.normalizedValue ?? "");
+    const payload = {
+      ...existing.payload,
+      ...(patch.semanticType ? { semanticType: patch.semanticType } : {}),
+      ...(patch.value ? { value: patch.value } : {}),
+      normalizedValue,
+      ...(patch.risk ? { risk: patch.risk } : {}),
+      ...(patch.latestEvidenceId ? { latestEvidenceId: patch.latestEvidenceId } : {}),
+      ...(patch.requiresConfirmation !== undefined ? { requiresConfirmation: patch.requiresConfirmation } : {})
+    };
+    const graphStatus = patch.status === "observed" ? "candidate" : (patch.status ?? existing.status);
+    this.db
+      .prepare(
+        `UPDATE nodes
+         SET label = ?, payload_json = ?, confidence = ?, status = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(
+        `${attributeKey}: ${normalizedValue}`,
+        stringify(payload),
+        patch.confidence ?? existing.confidence,
+        graphStatus,
+        patch.updatedAt,
+        id
+      );
+  }
+
+  private ensureProfileAttributeEdge(
+    attributeNodeId: string,
+    attributeKey: string,
+    confidence: number,
+    createdAt: string,
+    updatedAt: string
+  ): void {
+    const existing = this.db
+      .prepare(
+        `SELECT id FROM edges
+         WHERE source_node_id = ? AND target_node_id = ? AND relation = 'has_attribute'
+         LIMIT 1`
+      )
+      .get(DEFAULT_OWNER_PROFILE_ID, attributeNodeId);
+    if (existing) {
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO edges
+         (id, source_node_id, relation, target_node_id, payload_json, status, confidence, scope_type, scope_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        createId("edge"),
+        DEFAULT_OWNER_PROFILE_ID,
+        "has_attribute",
+        attributeNodeId,
+        stringify({ attributeKey }),
+        "active",
+        confidence,
+        "profile",
+        DEFAULT_OWNER_PROFILE_ID,
+        createdAt,
+        updatedAt
+      );
+  }
+
+  private migrateProfileAttributesToGraph(): void {
+    const rows = this.db.prepare("SELECT * FROM profile_attributes ORDER BY created_at ASC").all();
+    if (rows.length === 0) {
+      return;
+    }
+    for (const row of rows) {
+      const attribute = mapProfileAttribute(row);
+      if (this.getGraphNode(attribute.id)) {
+        continue;
+      }
+      const node = buildProfileAttributeNodeFromAttribute(attribute);
+      this.insertNode(node);
+      this.ensureProfileAttributeEdge(
+        attribute.id,
+        attribute.key,
+        attribute.confidence,
+        attribute.createdAt,
+        attribute.updatedAt
+      );
+    }
+    this.db.prepare("DELETE FROM profile_attributes").run();
+  }
+
+  private createProfileAttributeHistory(
+    attributeId: string,
+    operation: ProfilePatchOperation,
+    oldValue: JsonRecord | undefined,
+    newValue: JsonRecord | undefined,
+    evidenceId: string | undefined,
+    reason: string | undefined
+  ): ProfileAttributeHistory {
+    const history: ProfileAttributeHistory = {
+      id: createId("profile_hist"),
+      attributeId,
+      operation,
+      oldValue,
+      newValue,
+      evidenceId,
+      reason,
+      createdAt: nowIso()
+    };
+    this.db
+      .prepare(
+        `INSERT INTO profile_attribute_history
+         (id, attribute_id, operation, old_value_json, new_value_json, evidence_id, reason, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        history.id,
+        attributeId,
+        operation,
+        oldValue ? stringify(oldValue) : null,
+        newValue ? stringify(newValue) : null,
+        evidenceId ?? null,
+        reason ?? null,
+        history.createdAt
+      );
+    return history;
+  }
+
+  private listProfileAttributeHistory(attributeId: string): ProfileAttributeHistory[] {
+    return this.db
+      .prepare("SELECT * FROM profile_attribute_history WHERE attribute_id = ? ORDER BY created_at ASC")
+      .all(attributeId)
+      .map(mapProfileAttributeHistory);
+  }
+
+  private importLegacyProfileFactCandidates(): void {
+    const candidates = this.db
+      .prepare("SELECT * FROM memory_candidates WHERE kind = ? ORDER BY created_at ASC")
+      .all("profile_fact")
+      .map(mapMemoryCandidate);
+    for (const candidate of candidates) {
+      const payload = candidate.payload;
+      const predicate = typeof payload.predicate === "string" ? payload.predicate : candidate.proposedRelation;
+      const object = typeof payload.object === "string" ? payload.object : candidate.label;
+      if (!predicate || !object) {
+        continue;
+      }
+      const key = legacyProfileAttributeKey(predicate);
+      const existing = this.findProfileAttribute(key);
+      if (existing?.normalizedValue === object) {
+        continue;
+      }
+      if (existing) {
+        continue;
+      }
+      const evidenceId = candidate.evidenceIds[0];
+      const attribute = this.insertProfileAttributeFromLegacyCandidate(candidate, key, object, evidenceId);
+      this.createProfileAttributeHistory(
+        attribute.id,
+        "add",
+        undefined,
+        attribute.value,
+        evidenceId,
+        "Imported from legacy profile_fact memory candidate."
+      );
+      this.createEvent("profile.attribute_added", "Profile attribute added", {
+        attributeId: attribute.id,
+        key: attribute.key,
+        status: attribute.status,
+        risk: attribute.risk,
+        importedFrom: candidate.id
+      });
+      this.createAuditRecord("system", "profile.attribute.import_legacy", "profile_attribute", attribute.id, {
+        key: attribute.key,
+        candidateId: candidate.id
+      });
+    }
+  }
+
+  private insertProfileAttributeFromLegacyCandidate(
+    candidate: MemoryCandidate,
+    key: string,
+    normalizedValue: string,
+    evidenceId: string | undefined
+  ): ProfileAttribute {
+    const now = candidate.createdAt;
+    const id = createId("profile_attr");
+    const status = candidate.status === "active" ? "active" : candidate.status === "quarantined" ? "quarantined" : "candidate";
+    const value = {
+      value: normalizedValue,
+      legacyCandidateId: candidate.id,
+      label: candidate.label
+    };
+    const proposal: ProfilePatchProposal = {
+      target: "owner_profile",
+      operation: "add",
+      attributeKey: key,
+      semanticType: "identity",
+      value,
+      normalizedValue,
+      confidence: candidate.confidence,
+      risk: candidate.risk,
+      evidenceQuote: candidate.label,
+      reason: "Imported from legacy profile_fact memory candidate."
+    };
+    const node = buildProfileAttributeNode({
+      id,
+      proposal,
+      evidenceId: evidenceId ?? createId("ev"),
+      status,
+      requiresConfirmation: candidate.requiresConfirmation,
+      createdAt: now,
+      updatedAt: candidate.updatedAt
+    });
+    this.insertNode(node);
+    this.ensureProfileAttributeEdge(id, key, candidate.confidence, now, candidate.updatedAt);
+    return this.requireProfileAttribute(id);
   }
 
   private requireLlmProviderConfig(id: string): LlmProviderConfig {
@@ -1813,6 +3515,209 @@ function cleanPhrase(value: string): string {
   return value.trim().replace(/\s+/g, " ").replace(/^that\s+/i, "");
 }
 
+function scoreMemoryNodeForQuery(node: GraphNode, queryText: string): number {
+  const haystack = memoryNodeSearchText(node);
+  const terms = queryTerms(queryText);
+  let score = 0;
+  for (const term of terms) {
+    if (haystack.includes(term)) {
+      score += term.length >= 4 ? 3 : 1;
+    }
+  }
+  const predicate = typeof node.payload.predicate === "string" ? node.payload.predicate : undefined;
+  if (predicate) {
+    for (const term of splitAttributeKey(predicate)) {
+      if (queryText.includes(term)) {
+        score += 8;
+      }
+    }
+  }
+  const attributeKey = typeof node.payload.attributeKey === "string" ? node.payload.attributeKey : undefined;
+  if (attributeKey) {
+    for (const term of splitAttributeKey(attributeKey)) {
+      if (queryText.includes(term)) {
+        score += 8;
+      }
+    }
+  }
+  if (node.type === "profile_attribute" && queryText.includes("我")) {
+    score += 2;
+  }
+  if (node.type === "profile_attribute" && isWeatherRelatedQuery(queryText) && isLocationProfileNode(node)) {
+    score += 12;
+  }
+  if (node.type === "profile_attribute" && isOutfitRelatedQuery(queryText) && isGenderProfileNode(node)) {
+    score += 12;
+  }
+  if (node.type === "profile_attribute" && isOutfitRelatedQuery(queryText) && isLocationProfileNode(node)) {
+    score += 10;
+  }
+  return score;
+}
+
+function isOutfitRelatedQuery(queryText: string): boolean {
+  return /穿什么|怎么穿|穿衣|穿搭|搭配|outfit|what (?:should I )?wear|clothes to wear|dress for/i.test(queryText);
+}
+
+function isGenderProfileNode(node: GraphNode): boolean {
+  const attributeKey = typeof node.payload.attributeKey === "string" ? node.payload.attributeKey : "";
+  return /gender|sex|性别/i.test(attributeKey);
+}
+
+function isWeatherRelatedQuery(queryText: string): boolean {
+  return /天气|气温|预报|下雨|下雪|weather|forecast|rain|snow/i.test(queryText);
+}
+
+function isLocationProfileNode(node: GraphNode): boolean {
+  const semanticType = typeof node.payload.semanticType === "string" ? node.payload.semanticType : "";
+  const attributeKey = typeof node.payload.attributeKey === "string" ? node.payload.attributeKey : "";
+  return semanticType === "location" || /city|home|resident|location|address|常驻地|城市|所在地|居住/i.test(attributeKey);
+}
+
+function memoryNodeSearchText(node: GraphNode): string {
+  return [
+    node.type,
+    node.label,
+    JSON.stringify(node.payload),
+    typeof node.payload.object === "string" ? node.payload.object : "",
+    typeof node.payload.value === "string" ? node.payload.value : ""
+  ].join(" ").toLowerCase();
+}
+
+function queryTerms(queryText: string): string[] {
+  const latinTerms = queryText
+    .split(/[^a-z0-9_]+/i)
+    .map((term) => term.trim().toLowerCase())
+    .filter((term) => term.length >= 3);
+  const chineseTerms = Array.from(queryText.matchAll(/[\u3400-\u9fff]{2,}/g))
+    .flatMap((match) => chineseNgrams(match[0]));
+  return Array.from(new Set([...latinTerms, ...chineseTerms]));
+}
+
+function chineseNgrams(value: string): string[] {
+  const terms = new Set<string>();
+  for (let size = Math.min(4, value.length); size >= 2; size -= 1) {
+    for (let index = 0; index <= value.length - size; index += 1) {
+      terms.add(value.slice(index, index + size));
+    }
+  }
+  return Array.from(terms);
+}
+
+function splitAttributeKey(attributeKey: string): string[] {
+  return attributeKey.toLowerCase().split(/[_\s]+/).filter((part) => part.length > 2);
+}
+
+function legacyProfileAttributeKey(predicate: string): string {
+  return predicate
+    .trim()
+    .toLowerCase()
+    .replace(/^has_/, "")
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "") || "profile_attribute";
+}
+
+function mergeExtractedMemories(memories: ExtractedMemory[]): ExtractedMemory[] {
+  const merged = new Map<string, ExtractedMemory>();
+  for (const memory of memories) {
+    const key = extractedMemoryKey(memory);
+    const existing = merged.get(key);
+    if (!existing || memory.confidence > existing.confidence) {
+      merged.set(key, memory);
+    }
+  }
+  return Array.from(merged.values());
+}
+
+function extractedMemoryKey(memory: ExtractedMemory): string {
+  return memoryIdentityKey(memory.kind, memory.payload, memory.label);
+}
+
+function candidateKey(candidate: MemoryCandidate): string {
+  return memoryIdentityKey(candidate.kind, candidate.payload, candidate.label);
+}
+
+function chooseMemoryCandidateToKeep(candidates: MemoryCandidate[]): MemoryCandidate {
+  return [...candidates].sort((left, right) => {
+    const statusDelta = memoryStatusRank(left.status) - memoryStatusRank(right.status);
+    if (statusDelta !== 0) {
+      return statusDelta;
+    }
+    return left.createdAt.localeCompare(right.createdAt);
+  })[0]!;
+}
+
+function normalizeProfileOperation(
+  proposal: ProfilePatchProposal,
+  existing: ProfileAttribute | undefined
+): ProfilePatchOperation {
+  if (proposal.operation === "ignore") {
+    return "ignore";
+  }
+  if (!existing) {
+    return proposal.operation === "ask_confirmation" ? "ask_confirmation" : "add";
+  }
+  if (existing.normalizedValue === proposal.normalizedValue) {
+    return "ignore";
+  }
+  if (proposal.operation === "replace" || proposal.operation === "update") {
+    return proposal.operation;
+  }
+  if (proposal.operation === "ask_confirmation") {
+    return "ask_confirmation";
+  }
+  return "conflict";
+}
+
+function memoryStatusRank(status: MemoryStatus): number {
+  if (status === "active") {
+    return 0;
+  }
+  if (status === "candidate") {
+    return 1;
+  }
+  if (status === "quarantined") {
+    return 2;
+  }
+  return 3;
+}
+
+function memoryIdentityKey(kind: string, payload: JsonRecord, label: string): string {
+  const predicate = scalarKey(payload.predicate);
+  const object = scalarKey(payload.object);
+  const subject = scalarKey(payload.subject);
+  const value = object || scalarKey(payload.value);
+  if (value) {
+    return [kind, value].join("|");
+  }
+  if (predicate || object || subject) {
+    return [kind, subject, predicate, object].join("|");
+  }
+  return [kind, label.trim().toLowerCase()].join("|");
+}
+
+function scalarKey(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function isPathWithinScope(targetPath: string, scopePath: string): boolean {
+  const normalizedTarget = normalizePathForPolicy(targetPath);
+  const normalizedScope = normalizePathForPolicy(scopePath);
+  return normalizedTarget === normalizedScope || normalizedTarget.startsWith(`${normalizedScope}/`);
+}
+
+function normalizePathForPolicy(value: string): string {
+  return value.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function isForbiddenWorkerPath(value: string): boolean {
+  const normalized = normalizePathForPolicy(value).toLowerCase();
+  return /(^|\/)(\.env|\.ssh|node_modules|dist|build|\.git)(\/|$)/.test(normalized)
+    || /\.(sqlite|sqlite3|db|pem|key|p12|pfx)$/i.test(normalized)
+    || normalized.includes("credential")
+    || normalized.includes("secret");
+}
+
 function relationForNodeType(nodeType: string): string {
   if (nodeType === "preference") {
     return "prefers";
@@ -1839,22 +3744,6 @@ function inferToolRisk(name: string, description: string): RiskLevel {
     return "medium";
   }
   return "low";
-}
-
-function builtInSkill(name: string, description: string, requiredTools: string[]): SkillDefinition {
-  const now = nowIso();
-  return {
-    id: `skill_builtin_${slugId(name)}`,
-    name,
-    description,
-    sourceType: "built_in",
-    instructionMarkdown: `# ${name}\n\n## Instructions\n${description}\n\n## Safety\nUse only policy-approved tools. Do not expose hidden chain-of-thought. Return audit-safe summaries and observations.`,
-    requiredTools,
-    riskLevel: "low",
-    enabled: true,
-    createdAt: now,
-    updatedAt: now
-  };
 }
 
 function mapConversation(row: Record<string, unknown>): Conversation {
@@ -1927,6 +3816,172 @@ function mapMemoryCandidate(row: Record<string, unknown>): MemoryCandidate {
   };
 }
 
+function profileAttributeFromNode(node: GraphNode): ProfileAttribute {
+  return {
+    id: node.id,
+    profileId: node.scopeId ?? DEFAULT_OWNER_PROFILE_ID,
+    key: String(node.payload.attributeKey ?? ""),
+    semanticType: (node.payload.semanticType as ProfileSemanticType) ?? "other",
+    value: typeof node.payload.value === "object" && node.payload.value !== null
+      ? node.payload.value as JsonRecord
+      : {},
+    normalizedValue: String(node.payload.normalizedValue ?? ""),
+    confidence: node.confidence,
+    risk: (node.payload.risk as RiskLevel) ?? "low",
+    status: node.status as MemoryStatus,
+    latestEvidenceId: node.payload.latestEvidenceId ? String(node.payload.latestEvidenceId) : undefined,
+    requiresConfirmation: Boolean(node.payload.requiresConfirmation),
+    createdAt: node.createdAt,
+    updatedAt: node.updatedAt,
+    history: []
+  };
+}
+
+function buildProfileAttributeNode(input: {
+  id: string;
+  proposal: ProfilePatchProposal;
+  evidenceId: string;
+  status: MemoryStatus;
+  requiresConfirmation: boolean;
+  createdAt: string;
+  updatedAt: string;
+}): GraphNode {
+  return {
+    id: input.id,
+    type: "profile_attribute",
+    label: `${input.proposal.attributeKey}: ${input.proposal.normalizedValue}`,
+    payload: {
+      attributeKey: input.proposal.attributeKey,
+      semanticType: input.proposal.semanticType,
+      value: input.proposal.value,
+      normalizedValue: input.proposal.normalizedValue,
+      risk: input.proposal.risk,
+      requiresConfirmation: input.requiresConfirmation,
+      latestEvidenceId: input.evidenceId
+    },
+    status: input.status === "observed" ? "candidate" : input.status,
+    confidence: input.proposal.confidence,
+    scopeType: "profile",
+    scopeId: DEFAULT_OWNER_PROFILE_ID,
+    origin: "owner_profile",
+    createdAt: input.createdAt,
+    updatedAt: input.updatedAt
+  };
+}
+
+function buildProfileAttributeNodeFromAttribute(attribute: ProfileAttribute): GraphNode {
+  return {
+    id: attribute.id,
+    type: "profile_attribute",
+    label: `${attribute.key}: ${attribute.normalizedValue}`,
+    payload: {
+      attributeKey: attribute.key,
+      semanticType: attribute.semanticType,
+      value: attribute.value,
+      normalizedValue: attribute.normalizedValue,
+      risk: attribute.risk,
+      requiresConfirmation: attribute.requiresConfirmation,
+      latestEvidenceId: attribute.latestEvidenceId
+    },
+    status: attribute.status === "observed" ? "candidate" : attribute.status,
+    confidence: attribute.confidence,
+    scopeType: "profile",
+    scopeId: DEFAULT_OWNER_PROFILE_ID,
+    origin: "owner_profile",
+    createdAt: attribute.createdAt,
+    updatedAt: attribute.updatedAt
+  };
+}
+
+function mapProfileAttribute(row: Record<string, unknown>): ProfileAttribute {
+  return {
+    id: String(row.id),
+    profileId: String(row.profile_id),
+    key: String(row.key),
+    semanticType: row.semantic_type as ProfileSemanticType,
+    value: parseJson<JsonRecord>(row.value_json, {}),
+    normalizedValue: String(row.normalized_value),
+    confidence: Number(row.confidence),
+    risk: row.risk as RiskLevel,
+    status: row.status as MemoryStatus,
+    latestEvidenceId: row.latest_evidence_id ? String(row.latest_evidence_id) : undefined,
+    requiresConfirmation: Boolean(row.requires_confirmation),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+    history: []
+  };
+}
+
+function mapProfileAttributeHistory(row: Record<string, unknown>): ProfileAttributeHistory {
+  return {
+    id: String(row.id),
+    attributeId: String(row.attribute_id),
+    operation: row.operation as ProfilePatchOperation,
+    oldValue: row.old_value_json ? parseJson<JsonRecord>(row.old_value_json, {}) : undefined,
+    newValue: row.new_value_json ? parseJson<JsonRecord>(row.new_value_json, {}) : undefined,
+    evidenceId: row.evidence_id ? String(row.evidence_id) : undefined,
+    reason: row.reason ? String(row.reason) : undefined,
+    createdAt: String(row.created_at)
+  };
+}
+
+function mapWorkerPairCode(row: Record<string, unknown>): WorkerPairCode {
+  return {
+    id: String(row.id),
+    status: row.status as WorkerPairCode["status"],
+    expiresAt: String(row.expires_at),
+    createdAt: String(row.created_at),
+    usedAt: row.used_at ? String(row.used_at) : undefined
+  };
+}
+
+function normalizeWebSearchProvider(value: unknown): WebSearchProvider {
+  if (value === "brave" || value === "searxng" || value === "duckduckgo" || value === "bailian") {
+    return value;
+  }
+  return "duckduckgo";
+}
+
+function normalizeBoundedInt(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function hashSecret(secret: string): string {
+  return createHash("sha256").update(secret).digest("hex");
+}
+
+function safeEqual(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function formatPairCode(raw: string): string {
+  return `${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 10)}`;
+}
+
+function isWebToolsRuntimeConfigured(config: WebToolsConfig): boolean {
+  if (!config.enabled) {
+    return false;
+  }
+  switch (config.searchProvider) {
+    case "brave":
+      return Boolean(config.braveApiKey);
+    case "bailian":
+      return Boolean(config.dashscopeApiKey);
+    case "searxng":
+      return Boolean(config.searxngUrl);
+    case "duckduckgo":
+      return true;
+    default:
+      return false;
+  }
+}
+
 function normalizeAssistantReplyLocale(value: unknown): Settings["assistantReplyLocale"] {
   if (value === "en" || value === "zh-CN" || value === "follow_ui") {
     return value;
@@ -1972,12 +4027,60 @@ function mapWorker(row: Record<string, unknown>): Worker {
     id: String(row.id),
     displayName: String(row.display_name),
     environment: String(row.environment),
+    hostName: row.host_name ? String(row.host_name) : undefined,
+    os: row.os ? String(row.os) : undefined,
     location: row.location ? String(row.location) : undefined,
     status: row.status as Worker["status"],
     metadata: parseJson<JsonRecord>(row.metadata_json, {}),
     lastSeenAt: row.last_seen_at ? String(row.last_seen_at) : undefined,
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at)
+  };
+}
+
+function mapWorkerCapability(row: Record<string, unknown>): Capability {
+  return {
+    id: String(row.id),
+    workerId: String(row.worker_id),
+    name: String(row.name),
+    risk: row.risk as RiskLevel,
+    readOnly: Boolean(row.read_only),
+    requiresConfirmation: Boolean(row.requires_confirmation),
+    allowedScopes: parseJson<string[]>(row.allowed_scopes_json, []),
+    inputSchema: parseJson<JsonRecord>(row.input_schema_json, {}),
+    outputSchema: parseJson<JsonRecord>(row.output_schema_json, {}),
+    enabled: row.enabled === undefined ? true : Boolean(row.enabled),
+    createdAt: String(row.created_at),
+    updatedAt: row.updated_at ? String(row.updated_at) : undefined
+  };
+}
+
+function mapWorkerPathScope(row: Record<string, unknown>): WorkerPathScope {
+  return {
+    id: String(row.id),
+    workerId: String(row.worker_id),
+    label: String(row.label),
+    path: String(row.path),
+    mode: row.mode as WorkerPathScope["mode"],
+    enabled: Boolean(row.enabled),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at)
+  };
+}
+
+function mapWorkerJob(row: Record<string, unknown>): WorkerJob {
+  return {
+    id: String(row.id),
+    workerId: String(row.worker_id),
+    capability: String(row.capability),
+    input: parseJson<JsonRecord>(row.input_json, {}),
+    status: row.status as WorkerJobStatus,
+    result: row.result_json ? parseJson<JsonRecord>(row.result_json, {}) : undefined,
+    error: row.error ? String(row.error) : undefined,
+    timeoutMs: Number(row.timeout_ms),
+    createdAt: String(row.created_at),
+    startedAt: row.started_at ? String(row.started_at) : undefined,
+    completedAt: row.completed_at ? String(row.completed_at) : undefined
   };
 }
 
@@ -2081,6 +4184,7 @@ function mapSkillDefinition(row: Record<string, unknown>): SkillDefinition {
     requiredTools: parseJson<string[]>(row.required_tools_json, []),
     riskLevel: row.risk_level as RiskLevel,
     enabled: Boolean(row.enabled),
+    storagePath: row.storage_path ? String(row.storage_path) : undefined,
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at)
   };
@@ -2234,6 +4338,40 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS profiles (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS profile_attributes (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,
+  semantic_type TEXT NOT NULL,
+  value_json TEXT NOT NULL DEFAULT '{}',
+  normalized_value TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  risk TEXT NOT NULL,
+  status TEXT NOT NULL,
+  latest_evidence_id TEXT,
+  requires_confirmation INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS profile_attribute_history (
+  id TEXT PRIMARY KEY,
+  attribute_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  operation TEXT NOT NULL,
+  old_value_json TEXT,
+  new_value_json TEXT,
+  evidence_id TEXT,
+  reason TEXT,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   id TEXT PRIMARY KEY,
   actor_type TEXT NOT NULL,
@@ -2249,12 +4387,24 @@ CREATE TABLE IF NOT EXISTS workers (
   id TEXT PRIMARY KEY,
   display_name TEXT NOT NULL,
   environment TEXT NOT NULL,
+  host_name TEXT,
+  os TEXT,
   location TEXT,
   status TEXT NOT NULL,
   metadata_json TEXT NOT NULL DEFAULT '{}',
+  credential_hash TEXT,
   last_seen_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS worker_pair_codes (
+  id TEXT PRIMARY KEY,
+  code_hash TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  used_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS worker_capabilities (
@@ -2267,6 +4417,42 @@ CREATE TABLE IF NOT EXISTS worker_capabilities (
   allowed_scopes_json TEXT NOT NULL DEFAULT '[]',
   input_schema_json TEXT NOT NULL DEFAULT '{}',
   output_schema_json TEXT NOT NULL DEFAULT '{}',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS worker_path_scopes (
+  id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  path TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS worker_jobs (
+  id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  capability TEXT NOT NULL,
+  input_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL,
+  result_json TEXT,
+  error TEXT,
+  timeout_ms INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS worker_events (
+  id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  job_id TEXT,
+  type TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL
 );
 

@@ -2,9 +2,20 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Sedna 是一个单用户、自托管私人助理 agent 系统。
+Sedna 是一个单用户、自托管私人助理 agent 系统，核心是私有图记忆和分布式设备 Worker。
 
-这个项目正在从一个干净的新方向重新开始。它的目标不是做一个通用聊天机器人、SaaS 助理，或者 Electron 桌面壳。它的目标是构建一个可复用的开源框架，让每个人都可以部署属于自己的私人助理。
+很多 agent 产品把长期记忆做成分散的聊天记录、笔记或向量化文本片段，也通常只能围绕一台设备或一个云端工作区运行。Sedna 选择另一条路线：把你的生活、项目、设备、资源、偏好、任务和权限组织成一个由中央大脑拥有的可见记忆图，再让你自己设备上的可信 Worker 提供受限的本地上下文和执行能力。
+
+这个项目正在从一个干净的新方向重新开始。它的目标不是做一个通用聊天机器人、SaaS 助理，或者 Electron 桌面壳。它的目标是构建一个可复用的开源框架，让每个人都可以部署属于自己的私人助理基础设施。
+
+## 为什么是 Sedna
+
+Sedna 最重要的是两个核心点：
+
+- **图记忆，而不是分散文本记忆**：长期记忆应该是可查看、可编辑、有证据、有关联的。偏好、项目、文件、联系人、Worker、权限、任务和产物都可以成为图里的节点和关系，而不是沉进不透明的聊天记录里。
+- **分布式 Worker，而不是单设备自动化**：真正有用的私人上下文往往分布在多台机器上。家里的服务器、办公室电脑、NAS、VPS 和本地笔记本都可以向同一个中央大脑暴露受限能力，但它们不会变成多个独立大脑。
+
+这种架构可以支持单设备 agent 很难自然完成的协同流程。比如，用户可以让 Sedna 从设备 A 取一个文件、从设备 B 取另一个文件，把两个文件一起作为同一封邮件的附件准备好；中央大脑检查权限和风险，在发送前请求确认，并审计每一步。中央大脑负责计划、记忆、权限和审计，Worker 只执行受限的本地任务。
 
 ## 当前方向
 
@@ -40,6 +51,7 @@ Sedna 的设计围绕以下核心展开：
 - [docs/agent-workbench-ui-design.md](docs/agent-workbench-ui-design.md)
 - [docs/i18n-mvp-design.md](docs/i18n-mvp-design.md)
 - [docs/mcp-and-skills-mvp-design.md](docs/mcp-and-skills-mvp-design.md)
+- [docs/worker-mvp-usage.zh-CN.md](docs/worker-mvp-usage.zh-CN.md)
 
 这些文档是当前设计讨论的事实来源。它们是工作检查点，不是最终实现规格。
 
@@ -78,12 +90,12 @@ Web UI
 - TypeScript + pnpm workspace monorepo
 - `apps/brain` 中的中央大脑 API 服务
 - `apps/web` 中的 React + Vite Web UI
-- `apps/worker` 中的 mock-only worker 包
+- `apps/worker` 中的只读 Worker MVP runtime
 - `apps/cli` 中的 CLI 骨架
 - `packages/` 下的共享 protocol、memory、policy 和工具包
 - 基于 SQLite 的规范记忆图 schema 和 migration
-- 会话时间线、候选记忆审核、图查询、mock worker 注册和审计查询 API
-- LLM provider 边界，支持 deterministic `mock` 模式和真实 `openai` 模式
+- 会话时间线、候选记忆审核、图查询、worker 注册/任务 API 和审计查询 API
+- LLM provider 边界，面向真实 provider 配置
 - Agent Runtime 和 React Agent Workbench 是当前 MVP 设计目标
 - 动态 LLM 配置、MCP 和 Skills 是计划中的 MVP 设置能力
 
@@ -114,13 +126,44 @@ pnpm dev:brain
 pnpm dev:web
 ```
 
+创建一次性 worker pair code：
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/api/workers/pair-codes \
+  -H 'Content-Type: application/json' \
+  -d '{"ttl_ms":600000}'
+```
+
+再另开一个终端配对本地只读 Worker：
+
+```bash
+SEDNA_BRAIN_URL=http://127.0.0.1:8787 \
+SEDNA_WORKER_NAME="Local Worker" \
+SEDNA_WORKER_ALLOWED_PATHS="$HOME/Documents:$HOME/Projects" \
+pnpm dev:worker pair --code <PAIR-CODE>
+```
+
+然后启动已配对 worker：
+
+```bash
+pnpm dev:worker
+```
+
+然后打开 Workers 页面：
+
+```text
+http://127.0.0.1:5173/workers
+```
+
+Worker MVP 的详细启动方式、支持能力、API 示例和安全规则见 [docs/worker-mvp-usage.zh-CN.md](docs/worker-mvp-usage.zh-CN.md)。
+
 LLM 配置：
 
 ```bash
 cp .env.example .env
 ```
 
-默认 provider 是 `mock`，不需要密钥，适合测试和离线开发。要使用真实 OpenAI 对话能力，设置：
+Sedna 不再提供产品级 mock LLM provider。请在 Settings 中配置真实 provider，或通过环境变量配置 OpenAI：
 
 ```text
 LLM_PROVIDER=openai

@@ -9,6 +9,6 @@ describe("OpenAI provider configuration", () => {
         OPENAI_API_KEY: "",
         OPENAI_MODEL: "gpt-4.1-mini"
       })
-    ).toThrow("OpenAI provider requires OPENAI_API_KEY. Set OPENAI_API_KEY or use LLM_PROVIDER=mock.");
+    ).toThrow("OpenAI provider requires OPENAI_API_KEY.");
   });
 });

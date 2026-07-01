@@ -8,8 +8,9 @@
     "build": "pnpm -r build",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
-    "dev:brain": "pnpm --filter @sedna/brain dev",
-    "dev:web": "pnpm --filter @sedna/web dev"
+    "dev:brain": "pnpm --filter @sedna/memory build && pnpm --filter @sedna/brain dev",
+    "dev:web": "pnpm --filter @sedna/web dev",
+    "dev:worker": "pnpm --filter @sedna/worker dev"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

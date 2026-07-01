@@ -17,7 +17,7 @@ Sedna should be able to:
 - classify memory risk and confidence
 - write events, evidence, candidates, and audit records
 
-The first implementation should support both a real provider and a mock provider. Dynamic provider configuration and model routing are defined in:
+The product implementation should require a real configured provider. Dynamic provider configuration and model routing are defined in:
 
 - [docs/dynamic-llm-config-design.md](dynamic-llm-config-design.md)
 
@@ -31,7 +31,6 @@ Recommended structure:
 apps/brain/src/llm/
   provider.ts
   openai-provider.ts
-  mock-provider.ts
   prompts/
     chat.ts
     extract-memory.ts
@@ -49,22 +48,24 @@ The exact TypeScript names can change, but the boundary must remain clear.
 
 ## Required Providers
 
-The MVP should include:
+The product MVP should include real provider adapters, starting with:
 
-- `mock`: deterministic local provider for tests, smoke checks, and demos without secrets
 - `openai`: real provider for actual conversation
+- OpenAI-compatible, Anthropic, and Gemini adapters through dynamic provider configuration
 
 Environment configuration:
 
 ```text
-LLM_PROVIDER=mock | openai
+LLM_PROVIDER=openai
 OPENAI_API_KEY=...
 OPENAI_MODEL=...
 ```
 
 No API key should be committed. `.env.example` may document required variables.
 
-If no provider is configured, the Brain should default to `mock` in development and tests.
+If no provider is configured, the Brain should return: `No LLM provider configured. Configure one in Settings.`
+
+Tests may use internal fake/test doubles that implement the provider interface. Those test doubles must not be exposed as product presets, Settings options, or runtime defaults.
 
 ## Reply Language
 
@@ -163,6 +164,10 @@ Candidate memory examples:
 - resource or method the owner values
 - task or suggested action
 
+Owner profile extraction uses patch proposals instead of fixed field detection. The LLM is responsible for semantic understanding and classification; Sedna is responsible for structure, merge, conflict handling, risk policy, evidence, audit, and persistence.
+
+Profile patch proposals use open vocabulary `attribute_key` values and finite `semantic_type` groups. Any known keys are naming examples and normalization hints, not an exhaustive list and not a closed enum. The system must not rely on hard-coded keyword rules such as “if message contains 星座, create zodiac_sign”. Unknown but useful attributes are allowed when they include evidence, confidence, risk, normalized value, and reason.
+
 ## Structured Output
 
 LLM extraction output must be validated before persistence.
@@ -229,12 +234,12 @@ If memory extraction fails after the assistant reply succeeds:
 
 ## Testing
 
-Tests and smoke checks should use `LLM_PROVIDER=mock`.
+Tests and smoke checks should use internal fake/test providers.
 
 Minimum checks:
 
 - posting a message creates owner and assistant messages
-- mock provider returns deterministic assistant text
+- internal fake provider returns deterministic assistant text
 - memory extraction creates candidate records
 - invalid extraction output is rejected
 - missing OpenAI key fails clearly when `LLM_PROVIDER=openai`

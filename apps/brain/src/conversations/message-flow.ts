@@ -1,13 +1,17 @@
 import type { ExtractedMemory, MemoryStore } from "@sedna/memory";
-import type { MemoryCandidate, Message, ResolvedAssistantReplyLocale, Settings } from "@sedna/protocol";
-import { ExtractionResultSchema, type ExtractedMemoryCandidate } from "../llm/schemas.js";
-import type { LlmProvider } from "../llm/provider.js";
+import type { MemoryCandidate, Message, ProfileAttribute, ProfilePatchProposal, ResolvedAssistantReplyLocale, Settings } from "@sedna/protocol";
+import { ExtractionResultSchema, type ExtractedMemoryCandidate, type ExtractedProfilePatchProposal } from "../llm/schemas.js";
+import type { LlmConversationInput, LlmProvider } from "../llm/provider.js";
+import { canUseAgentToolLoop, runChatWithWebTools, type ChatToolProgressEvent } from "../agent/chat-tool-loop.js";
+import { runWorkerActionFromMessage, buildWorkerInventoryContext } from "../agent/worker-actions.js";
+import { resolveMessageMentions } from "./mentions.js";
 
 export interface ConversationMessageFlowInput {
   store: MemoryStore;
   provider: LlmProvider;
   conversationId: string;
   content: string;
+  fetchImpl?: typeof fetch;
   onProgress?: (event: ConversationMessageFlowEvent) => void | Promise<void>;
 }
 
@@ -15,6 +19,7 @@ export interface ConversationMessageFlowResult {
   ownerMessage: Message;
   assistantMessage: Message;
   candidates: MemoryCandidate[];
+  profileAttributes: ProfileAttribute[];
 }
 
 export type ConversationMessageFlowEvent =
@@ -23,6 +28,9 @@ export type ConversationMessageFlowEvent =
   | { type: "assistant_delta"; content: string }
   | { type: "assistant_message"; message: Message }
   | { type: "memory_candidates"; candidates: MemoryCandidate[] }
+  | { type: "profile_attributes"; attributes: ProfileAttribute[] }
+  | { type: "tool_status"; tool: string; phase: "search" | "fetch" | "tool"; title: string; query?: string; url?: string }
+  | { type: "tool_result"; tool: string; summary: string }
   | { type: "error"; message: string };
 
 export async function runConversationMessageFlow(
@@ -30,41 +38,103 @@ export async function runConversationMessageFlow(
 ): Promise<ConversationMessageFlowResult> {
   const settings = input.store.getSettings();
   const replyLocale = resolveAssistantReplyLocale(settings);
+  const resolvedMentions = resolveMessageMentions(input.store, input.content);
   const ownerMessage = input.store.createMessage(input.conversationId, "owner", input.content, {
-    locale: settings.uiLocale
+    locale: settings.uiLocale,
+    ...(resolvedMentions.skills.length > 0 || resolvedMentions.tools.length > 0
+      ? {
+          mentions: {
+            skills: resolvedMentions.skills.map((skill) => ({ id: skill.id, name: skill.name })),
+            tools: resolvedMentions.tools.map((tool) => ({ id: tool.id, name: tool.name }))
+          }
+        }
+      : {})
   });
   input.store.recordMessageCreatedEvent(ownerMessage, "Owner message created");
   input.store.recordAuditRecord("owner", "message.create", "message", ownerMessage.id, {
-    conversationId: input.conversationId
+    conversationId: input.conversationId,
+    skillMentions: resolvedMentions.skills.map((skill) => skill.name),
+    toolMentions: resolvedMentions.tools.map((tool) => tool.name)
   });
   await input.onProgress?.({ type: "owner_message", message: ownerMessage });
-  await input.onProgress?.({ type: "assistant_status", phase: "thinking", title: "Thinking" });
+  for (const skill of resolvedMentions.skills) {
+    input.store.createSkillRun(
+      skill.id,
+      { ownerMessage: input.content, conversationId: input.conversationId },
+      { appliedToChat: true, skillName: skill.name }
+    );
+  }
+  const thinkingTitle = resolvedMentions.skills.length > 0
+    ? `Using skill: ${resolvedMentions.skills.map((skill) => skill.name).join(", ")}`
+    : resolvedMentions.tools.length > 0
+      ? `Using tools: ${resolvedMentions.tools.map((tool) => tool.name).join(", ")}`
+      : "Thinking";
+  await input.onProgress?.({ type: "assistant_status", phase: "thinking", title: thinkingTitle });
 
   const recentMessages = input.store
     .listRecentMessages(input.conversationId, 12)
     .filter((message) => message.id !== ownerMessage.id);
-  const activeMemories = input.store.listActiveMemoryNodes(input.content, 12);
+  const useAgentToolLoop = canUseAgentToolLoop(input.store);
+  const activeMemories = useAgentToolLoop ? [] : input.store.listActiveMemoryNodes(input.content, 12);
+  const workerInventory = buildWorkerInventoryContext(input.store);
+  let workerContext: string | undefined;
+  try {
+    workerContext = await runWorkerActionFromMessage({
+      store: input.store,
+      ownerMessage: input.content,
+      onProgress: async (event) => {
+        await input.onProgress?.(event);
+      }
+    });
+  } catch (error) {
+    await input.onProgress?.({ type: "error", message: normalizeError(error).message });
+  }
 
   let assistantContent: string;
   let assistantMetadata: Record<string, unknown>;
+  const replyInput: LlmConversationInput = {
+    ownerMessage: input.content,
+    recentMessages,
+    activeMemories,
+    replyLocale,
+    workerInventory,
+    workerContext,
+    agentToolsEnabled: useAgentToolLoop,
+    selectedSkills: resolvedMentions.skills.map((skill) => ({
+      name: skill.name,
+      description: skill.description,
+      instructionMarkdown: skill.instructionMarkdown,
+      requiredTools: skill.requiredTools
+    })),
+    selectedTools: resolvedMentions.tools.map((tool) => ({
+      name: tool.name,
+      title: tool.title,
+      description: tool.description,
+      source: tool.source
+    }))
+  };
   try {
-    const replyInput = {
-      ownerMessage: input.content,
-      recentMessages,
-      activeMemories,
-      replyLocale
-    };
-    const reply = input.provider.streamAssistantReply
-      ? await input.provider.streamAssistantReply(replyInput, async (delta) => {
-          await input.onProgress?.({ type: "assistant_delta", content: delta });
+    const reply = useAgentToolLoop
+      ? await runChatWithWebTools(replyInput, {
+          store: input.store,
+          fetchImpl: input.fetchImpl,
+          onProgress: async (event: ChatToolProgressEvent) => {
+            await input.onProgress?.(event);
+          }
         })
-      : await input.provider.generateAssistantReply(replyInput);
+      : input.provider.streamAssistantReply
+        ? await input.provider.streamAssistantReply(replyInput, async (delta) => {
+            await input.onProgress?.({ type: "assistant_delta", content: delta });
+          })
+        : await input.provider.generateAssistantReply(replyInput);
     assistantContent = reply.content;
     assistantMetadata = {
       generatedFrom: ownerMessage.id,
       provider: reply.provider,
       model: reply.model,
-      locale: replyLocale
+      locale: replyLocale,
+      ...(useAgentToolLoop ? { agentToolsUsed: true } : {}),
+      ...(resolvedMentions.skills.length > 0 ? { skillsUsed: resolvedMentions.skills.map((skill) => skill.name) } : {})
     };
     await input.onProgress?.({ type: "assistant_status", phase: "reply_ready", title: "Reply ready" });
   } catch (error) {
@@ -88,22 +158,25 @@ export async function runConversationMessageFlow(
   input.store.recordMessageCreatedEvent(assistantMessage, "Assistant message created");
   await input.onProgress?.({ type: "assistant_message", message: assistantMessage });
 
-  const candidates: MemoryCandidate[] = [];
+  const extractedMemories: ExtractedMemory[] = [];
+  const profilePatchProposals: ProfilePatchProposal[] = [];
   if (!("error" in assistantMetadata)) {
     try {
       await input.onProgress?.({ type: "assistant_status", phase: "memory_extraction", title: "Extracting memory candidates" });
       const rawExtraction = await input.provider.extractMemoryCandidates({
         ownerMessage: input.content,
         assistantMessage: assistantContent,
-      recentMessages: input.store.listRecentMessages(input.conversationId, 12),
-      activeMemories,
-      replyLocale
+        recentMessages: input.store.listRecentMessages(input.conversationId, 12),
+        activeMemories: input.store.listActiveMemoryNodes(input.content, 12),
+        replyLocale
       });
       const parsed = ExtractionResultSchema.parse(rawExtraction);
       for (const candidate of parsed.candidates) {
-        candidates.push(input.store.createMemoryCandidate(toExtractedMemory(candidate, ownerMessage.locale), ownerMessage));
+        extractedMemories.push(toExtractedMemory(candidate, ownerMessage.locale));
       }
-      await input.onProgress?.({ type: "memory_candidates", candidates });
+      for (const proposal of parsed.profile_patches) {
+        profilePatchProposals.push(toProfilePatchProposal(proposal));
+      }
     } catch (error) {
       input.store.recordMemoryExtractionFailure(
         input.conversationId,
@@ -113,12 +186,24 @@ export async function runConversationMessageFlow(
       );
     }
   }
+
+  const candidates = input.store.createMemoryCandidatesFromMessage(ownerMessage, extractedMemories);
+  if (candidates.length > 0) {
+    await input.onProgress?.({ type: "memory_candidates", candidates });
+  }
+  const profileAttributes = profilePatchProposals
+    .map((proposal) => input.store.applyProfilePatchProposal(proposal, ownerMessage))
+    .filter((attribute): attribute is ProfileAttribute => Boolean(attribute));
+  if (profileAttributes.length > 0) {
+    await input.onProgress?.({ type: "profile_attributes", attributes: profileAttributes });
+  }
   await input.onProgress?.({ type: "assistant_status", phase: "done", title: "Done" });
 
   return {
     ownerMessage,
     assistantMessage,
-    candidates
+    candidates,
+    profileAttributes
   };
 }
 
@@ -139,6 +224,21 @@ function toExtractedMemory(candidate: ExtractedMemoryCandidate, locale: string |
     risk: candidate.risk,
     evidenceQuote: candidate.evidence_quote,
     locale
+  };
+}
+
+function toProfilePatchProposal(proposal: ExtractedProfilePatchProposal): ProfilePatchProposal {
+  return {
+    target: proposal.target,
+    operation: proposal.operation,
+    attributeKey: proposal.attribute_key,
+    semanticType: proposal.semantic_type,
+    value: proposal.value,
+    normalizedValue: proposal.normalized_value,
+    confidence: proposal.confidence,
+    risk: proposal.risk,
+    evidenceQuote: proposal.evidence_quote,
+    reason: proposal.reason
   };
 }
 

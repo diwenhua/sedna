@@ -1,5 +1,6 @@
 import type { McpDiscoveryResult } from "@sedna/memory";
 import type { McpServer } from "@sedna/protocol";
+import { normalizeMcpToolResult, StreamableHttpMcpSession } from "./streamable-http.js";
 
 export interface McpConnectionTestResult {
   ok: boolean;
@@ -12,34 +13,34 @@ export interface McpToolCallResult {
   content: Record<string, unknown>;
 }
 
+export interface McpClientOptions {
+  fetchImpl?: typeof fetch;
+}
+
 export class McpClient {
+  constructor(private readonly options: McpClientOptions = {}) {}
+
   async testConnection(server: McpServer): Promise<McpConnectionTestResult> {
     if (!server.enabled) {
       return { ok: false, serverId: server.id, message: "MCP server is disabled" };
     }
-    if (isMockServer(server)) {
-      return { ok: true, serverId: server.id, message: "Mock MCP server is reachable" };
-    }
     if (server.transport === "stdio") {
       return {
-        ok: Boolean(server.command),
+        ok: false,
         serverId: server.id,
-        message: server.command ? "Stdio MCP server command is configured" : "Stdio MCP server command is missing"
+        message: "Stdio MCP transport is not supported yet. Use streamable_http for Bailian WebSearch."
       };
     }
     if (!server.url) {
       return { ok: false, serverId: server.id, message: "Streamable HTTP MCP server URL is missing" };
     }
     try {
-      const response = await fetch(server.url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...server.headers },
-        body: JSON.stringify({ jsonrpc: "2.0", id: "sedna-capabilities", method: "initialize", params: {} })
-      });
+      const session = new StreamableHttpMcpSession(server, this.options);
+      await session.connect();
       return {
-        ok: response.ok,
+        ok: true,
         serverId: server.id,
-        message: response.ok ? "Streamable HTTP MCP server responded" : `HTTP ${response.status}`
+        message: "Streamable HTTP MCP session established"
       };
     } catch (error) {
       return {
@@ -51,86 +52,15 @@ export class McpClient {
   }
 
   async discover(server: McpServer): Promise<McpDiscoveryResult> {
-    if (isMockServer(server)) {
-      return {
-        tools: [
-          {
-            name: "mock.echo",
-            title: "Mock Echo",
-            description: "Return the provided input as an audit-safe observation.",
-            inputSchema: { type: "object", properties: { text: { type: "string" } } },
-            outputSchema: { type: "object", properties: { text: { type: "string" } } },
-            riskLevel: "low"
-          },
-          {
-            name: "mock.external_write",
-            title: "Mock External Write",
-            description: "Simulate a risky external write action. Requires confirmation by default.",
-            inputSchema: { type: "object", properties: { target: { type: "string" } } },
-            outputSchema: { type: "object" },
-            riskLevel: "high"
-          }
-        ],
-        resources: [
-          {
-            uri: "mock://status",
-            name: "Mock status",
-            description: "Synthetic MCP server status resource.",
-            mimeType: "application/json"
-          }
-        ],
-        prompts: [
-          {
-            name: "mock.plan",
-            title: "Mock plan",
-            description: "Synthetic planning prompt.",
-            argumentsSchema: { type: "object" }
-          }
-        ]
-      };
+    if (server.transport !== "streamable_http" || !server.url) {
+      return { tools: [], resources: [], prompts: [] };
     }
-    if (server.transport === "streamable_http" && server.url) {
-      return this.discoverHttp(server);
-    }
-    return { tools: [], resources: [], prompts: [] };
-  }
-
-  async callTool(server: McpServer, toolName: string, input: Record<string, unknown>): Promise<McpToolCallResult> {
-    if (isMockServer(server)) {
-      return {
-        ok: true,
-        content: {
-          tool: toolName,
-          observation: toolName.includes("external_write")
-            ? "Mock external write was not executed; confirmation is required."
-            : input
-        }
-      };
-    }
-    if (server.transport === "streamable_http" && server.url) {
-      const response = await fetch(server.url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...server.headers },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: `sedna-tools-call-${Date.now()}`,
-          method: "tools/call",
-          params: { name: toolName, arguments: input }
-        })
-      });
-      if (!response.ok) {
-        throw new Error(`MCP tools/call failed: HTTP ${response.status}`);
-      }
-      return { ok: true, content: await response.json() as Record<string, unknown> };
-    }
-    throw new Error("MCP stdio execution is not enabled in this MVP runtime");
-  }
-
-  private async discoverHttp(server: McpServer): Promise<McpDiscoveryResult> {
+    const session = new StreamableHttpMcpSession(server, this.options);
+    await session.connect();
     const [tools, resources, prompts] = await Promise.all([
-      this.callListMethod(server, "tools/list"),
-      this.callListMethod(server, "resources/list"),
-      this.callListMethod(server, "prompts/list")
+      session.request("tools/list").catch(() => ({})),
+      session.request("resources/list").catch(() => ({})),
+      session.request("prompts/list").catch(() => ({}))
     ]);
     return {
       tools: normalizeTools(toArray(toResult(tools).tools)),
@@ -139,25 +69,25 @@ export class McpClient {
     };
   }
 
-  private async callListMethod(server: McpServer, method: string): Promise<Record<string, unknown>> {
-    const response = await fetch(server.url as string, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...server.headers },
-      body: JSON.stringify({ jsonrpc: "2.0", id: `sedna-${method}`, method, params: {} })
-    });
-    if (!response.ok) {
-      return {};
+  async callTool(server: McpServer, toolName: string, input: Record<string, unknown>): Promise<McpToolCallResult> {
+    if (server.transport !== "streamable_http" || !server.url) {
+      throw new Error("MCP tool execution requires a streamable_http server URL");
     }
-    return response.json() as Promise<Record<string, unknown>>;
+    const session = new StreamableHttpMcpSession(server, this.options);
+    await session.connect();
+    const result = await session.request("tools/call", { name: toolName, arguments: input });
+    return { ok: true, content: normalizeMcpToolResult(result) };
   }
 }
 
-function isMockServer(server: McpServer): boolean {
-  return server.command === "mock" || server.command === "mock-stdio" || server.name.toLowerCase().includes("mock");
-}
-
-function toResult(value: Record<string, unknown>): Record<string, unknown> {
-  return typeof value.result === "object" && value.result !== null ? value.result as Record<string, unknown> : value;
+function toResult(value: unknown): Record<string, unknown> {
+  if (typeof value === "object" && value !== null && "result" in value) {
+    const wrapped = value as { result?: unknown };
+    if (typeof wrapped.result === "object" && wrapped.result !== null) {
+      return wrapped.result as Record<string, unknown>;
+    }
+  }
+  return typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
 }
 
 function toArray(value: unknown): Record<string, unknown>[] {

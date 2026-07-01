@@ -34,6 +34,34 @@ export const MemoryStatusSchema = z.enum([
 ]);
 export type MemoryStatus = z.infer<typeof MemoryStatusSchema>;
 
+export const ProfileSemanticTypeSchema = z.enum([
+  "identity",
+  "preference",
+  "habit",
+  "interest",
+  "skill",
+  "work_context",
+  "communication_style",
+  "lifestyle",
+  "relationship",
+  "location",
+  "health",
+  "finance",
+  "sensitive",
+  "other"
+]);
+export type ProfileSemanticType = z.infer<typeof ProfileSemanticTypeSchema>;
+
+export const ProfilePatchOperationSchema = z.enum([
+  "add",
+  "update",
+  "replace",
+  "ignore",
+  "conflict",
+  "ask_confirmation"
+]);
+export type ProfilePatchOperation = z.infer<typeof ProfilePatchOperationSchema>;
+
 export const GraphStatusSchema = z.enum([
   "candidate",
   "active",
@@ -63,8 +91,24 @@ export const SettingsSchema = z.object({
 });
 export type Settings = z.infer<typeof SettingsSchema>;
 
+export const WebSearchProviderSchema = z.enum(["brave", "searxng", "duckduckgo", "bailian"]);
+export type WebSearchProvider = z.infer<typeof WebSearchProviderSchema>;
+
+export const WebToolsSettingsSchema = z.object({
+  enabled: z.boolean(),
+  searchProvider: WebSearchProviderSchema,
+  searchMaxResults: z.number().int().min(1).max(10),
+  fetchMaxChars: z.number().int().min(1000).max(50000),
+  fetchTimeoutMs: z.number().int().min(1000).max(60000),
+  searxngUrl: z.string().optional(),
+  hasBraveApiKey: z.boolean(),
+  hasDashscopeApiKey: z.boolean(),
+  configured: z.boolean(),
+  updatedAt: IsoDateStringSchema
+});
+export type WebToolsSettings = z.infer<typeof WebToolsSettingsSchema>;
+
 export const LlmAdapterTypeSchema = z.enum([
-  "mock",
   "openai-compatible",
   "openai-native",
   "anthropic",
@@ -149,23 +193,43 @@ export type Message = z.infer<typeof MessageSchema>;
 
 export const EventTypeSchema = z.enum([
   "conversation.created",
+  "conversation.renamed",
+  "conversation.deleted",
   "message.created",
   "memory.candidate_created",
   "memory.promoted",
   "memory.rejected",
   "memory.quarantined",
   "memory.extraction_failed",
+  "profile.attribute_added",
+  "profile.attribute_updated",
+  "profile.attribute_ignored",
+  "profile.attribute_conflict",
   "node.created",
   "edge.created",
   "task.suggested",
   "worker.registered",
+  "worker.pair_code.created",
+  "worker.paired",
+  "worker.revoked",
+  "worker.heartbeat",
+  "worker.online",
+  "worker.offline",
+  "worker.capability.updated",
+  "worker.path_scope.updated",
+  "worker.job.created",
+  "worker.job.started",
+  "worker.job.completed",
+  "worker.job.failed",
   "settings.updated",
+  "web.tools.updated",
   "llm.provider.created",
   "llm.provider.updated",
   "llm.provider.disabled",
   "llm.route.updated",
   "mcp.server.created",
   "mcp.server.updated",
+  "mcp.server.removed",
   "mcp.server.connected",
   "mcp.server.failed",
   "mcp.tools.refreshed",
@@ -174,6 +238,8 @@ export const EventTypeSchema = z.enum([
   "mcp.tool.failed",
   "skill.created",
   "skill.updated",
+  "skill.imported",
+  "skill.removed",
   "skill.enabled",
   "skill.disabled",
   "skill.run.started",
@@ -229,6 +295,59 @@ export const MemoryCandidateSchema = z.object({
   updatedAt: IsoDateStringSchema
 });
 export type MemoryCandidate = z.infer<typeof MemoryCandidateSchema>;
+
+export const ProfilePatchProposalSchema = z.object({
+  target: z.literal("owner_profile"),
+  operation: ProfilePatchOperationSchema,
+  attributeKey: z.string().min(1),
+  semanticType: ProfileSemanticTypeSchema,
+  value: z.record(z.unknown()).default({}),
+  normalizedValue: z.string().min(1),
+  confidence: z.number().min(0).max(1),
+  risk: RiskLevelSchema,
+  evidenceQuote: z.string().min(1),
+  reason: z.string().min(1)
+});
+export type ProfilePatchProposal = z.infer<typeof ProfilePatchProposalSchema>;
+
+export const ProfileAttributeHistorySchema = z.object({
+  id: z.string().min(1),
+  attributeId: z.string().min(1),
+  operation: ProfilePatchOperationSchema,
+  oldValue: z.record(z.unknown()).optional(),
+  newValue: z.record(z.unknown()).optional(),
+  evidenceId: z.string().optional(),
+  reason: z.string().optional(),
+  createdAt: IsoDateStringSchema
+});
+export type ProfileAttributeHistory = z.infer<typeof ProfileAttributeHistorySchema>;
+
+export const ProfileAttributeSchema = z.object({
+  id: z.string().min(1),
+  profileId: z.string().min(1),
+  key: z.string().min(1),
+  semanticType: ProfileSemanticTypeSchema,
+  value: z.record(z.unknown()).default({}),
+  normalizedValue: z.string().min(1),
+  confidence: z.number().min(0).max(1),
+  risk: RiskLevelSchema,
+  status: MemoryStatusSchema,
+  latestEvidenceId: z.string().optional(),
+  requiresConfirmation: z.boolean().default(false),
+  createdAt: IsoDateStringSchema,
+  updatedAt: IsoDateStringSchema,
+  history: z.array(ProfileAttributeHistorySchema).default([])
+});
+export type ProfileAttribute = z.infer<typeof ProfileAttributeSchema>;
+
+export const OwnerProfileSchema = z.object({
+  id: z.string().min(1),
+  ownerId: z.string().min(1),
+  createdAt: IsoDateStringSchema,
+  updatedAt: IsoDateStringSchema,
+  attributes: z.array(ProfileAttributeSchema).default([])
+});
+export type OwnerProfile = z.infer<typeof OwnerProfileSchema>;
 
 export const GraphNodeSchema = z.object({
   id: z.string().min(1),
@@ -354,6 +473,7 @@ export const SkillDefinitionSchema = z.object({
   requiredTools: z.array(z.string()).default([]),
   riskLevel: RiskLevelSchema,
   enabled: z.boolean(),
+  storagePath: z.string().optional(),
   createdAt: IsoDateStringSchema,
   updatedAt: IsoDateStringSchema
 });
@@ -374,10 +494,18 @@ export type SkillRun = z.infer<typeof SkillRunSchema>;
 export const WorkerStatusSchema = z.enum(["mock", "pending", "online", "offline", "revoked"]);
 export type WorkerStatus = z.infer<typeof WorkerStatusSchema>;
 
+export const WorkerPathScopeModeSchema = z.enum(["read_only", "read_write"]);
+export type WorkerPathScopeMode = z.infer<typeof WorkerPathScopeModeSchema>;
+
+export const WorkerJobStatusSchema = z.enum(["queued", "running", "completed", "failed", "cancelled"]);
+export type WorkerJobStatus = z.infer<typeof WorkerJobStatusSchema>;
+
 export const WorkerSchema = z.object({
   id: z.string().min(1),
   displayName: z.string().min(1),
   environment: z.string().min(1),
+  hostName: z.string().optional(),
+  os: z.string().optional(),
   location: z.string().optional(),
   status: WorkerStatusSchema,
   metadata: z.record(z.unknown()).default({}),
@@ -397,9 +525,48 @@ export const CapabilitySchema = z.object({
   allowedScopes: z.array(z.string()).default([]),
   inputSchema: z.record(z.unknown()).default({}),
   outputSchema: z.record(z.unknown()).default({}),
-  createdAt: IsoDateStringSchema
+  enabled: z.boolean().default(true),
+  createdAt: IsoDateStringSchema,
+  updatedAt: IsoDateStringSchema.optional()
 });
 export type Capability = z.infer<typeof CapabilitySchema>;
+
+export const WorkerPathScopeSchema = z.object({
+  id: z.string().min(1),
+  workerId: z.string().min(1),
+  label: z.string().min(1),
+  path: z.string().min(1),
+  mode: WorkerPathScopeModeSchema,
+  enabled: z.boolean(),
+  createdAt: IsoDateStringSchema,
+  updatedAt: IsoDateStringSchema
+});
+export type WorkerPathScope = z.infer<typeof WorkerPathScopeSchema>;
+
+export const WorkerJobSchema = z.object({
+  id: z.string().min(1),
+  workerId: z.string().min(1),
+  capability: z.string().min(1),
+  input: z.record(z.unknown()).default({}),
+  status: WorkerJobStatusSchema,
+  result: z.record(z.unknown()).optional(),
+  error: z.string().optional(),
+  timeoutMs: z.number().int().positive(),
+  createdAt: IsoDateStringSchema,
+  startedAt: IsoDateStringSchema.optional(),
+  completedAt: IsoDateStringSchema.optional()
+});
+export type WorkerJob = z.infer<typeof WorkerJobSchema>;
+
+export const WorkerEventSchema = z.object({
+  id: z.string().min(1),
+  workerId: z.string().min(1),
+  jobId: z.string().optional(),
+  type: z.string().min(1),
+  payload: z.record(z.unknown()).default({}),
+  createdAt: IsoDateStringSchema
+});
+export type WorkerEvent = z.infer<typeof WorkerEventSchema>;
 
 export const GraphResponseSchema = z.object({
   nodes: z.array(GraphNodeSchema),

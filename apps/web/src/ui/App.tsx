@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -17,6 +17,7 @@ import {
   Send,
   Settings as SettingsIcon,
   ShieldCheck,
+  Trash2,
   UserRound,
   X
 } from "lucide-react";
@@ -24,6 +25,8 @@ import { Background, Controls, ReactFlow, type Edge, type Node } from "@xyflow/r
 import type {
   AssistantReplyLocale,
   AuditRecord,
+  Capability,
+  Conversation,
   Evidence,
   Event,
   GraphResponse,
@@ -31,15 +34,22 @@ import type {
   LlmRoutePurpose,
   MemoryCandidate,
   Message,
+  RiskLevel,
   UiLocale,
-  Worker
+  Worker,
+  WorkerJob,
+  WorkerPathScope
 } from "@sedna/protocol";
 import {
   approveCandidate,
+  createWorkerPairCode,
+  createWorkerPathScope,
   createLlmProvider,
   createMcpServer,
-  createSkill,
   createConversation,
+  deleteConversation,
+  deleteSkill,
+  deleteWorkerPathScope,
   disableLlmProvider,
   disableMcpServer,
   editCandidate,
@@ -56,41 +66,66 @@ import {
   getSkills,
   getTimeline,
   getTools,
+  getWebToolsSettings,
+  getWorkerDetail,
   getWorkers,
   patchMcpServer,
   patchLlmProvider,
   patchLlmRoute,
   patchSettings,
+  patchWorkerCapability,
+  patchWorkerPathScope,
+  patchWebToolsSettings,
   patchSkill,
   patchToolPolicy,
-  registerMockWorker,
   rejectCandidate,
+  renameConversation,
   refreshMcpServer,
-  sendMessage,
+  revokeWorker,
   sendMessageStream,
   testMcpServer,
   testLlmProvider,
-  testSkillRun,
+  uploadSkillsZip,
   testTool,
+  testWebToolsSettings,
   type LlmModelRouteResponse,
   type LlmProviderPresetResponse,
   type LlmProviderResponse,
   type McpServerResponse,
   type SkillResponse,
-  type ToolRegistryResponse
+  type ToolRegistryResponse,
+  type WebToolsSettingsResponse,
+  type WorkerDetailResponse
 } from "../api.js";
 import { assistantReplyLocaleLabel, createTranslator, type TranslationKey } from "../i18n/index.js";
+import { MessageMarkdown } from "./MessageMarkdown.js";
 
-type MainTab = "chat" | "memory" | "tasks" | "graph" | "activity" | "audit" | "settings";
+type MainTab = "chat" | "memory" | "tasks" | "graph" | "workers" | "activity" | "audit" | "settings";
 type AgentRunStatus = "running" | "waiting_confirmation" | "completed" | "failed";
 type AgentStepStatus = "pending" | "running" | "waiting_confirmation" | "completed" | "failed";
 type PolicyResultStatus = "allowed" | "needs_confirmation" | "blocked";
 type TaskStatus = "suggested" | "accepted" | "dismissed";
 type ConfirmationStatus = "pending" | "approved" | "rejected";
 
+interface AppRoute {
+  tab: MainTab;
+  conversationId?: string;
+}
+
 interface LanguageSettings {
   uiLocale: UiLocale;
   assistantReplyLocale: AssistantReplyLocale;
+}
+
+interface WebToolsDraft {
+  enabled: boolean;
+  searchProvider: WebToolsSettingsResponse["search_provider"];
+  searchMaxResults: number;
+  fetchMaxChars: number;
+  fetchTimeoutMs: number;
+  searxngUrl: string;
+  braveApiKey: string;
+  dashscopeApiKey: string;
 }
 
 interface ProviderDraft {
@@ -114,15 +149,6 @@ interface McpServerDraft {
   headers: string;
   enabled: boolean;
   trustLevel: "untrusted" | "trusted" | "first_party";
-}
-
-interface SkillDraft {
-  name: string;
-  description: string;
-  instructionMarkdown: string;
-  requiredTools: string;
-  riskLevel: "low" | "medium" | "high";
-  enabled: boolean;
 }
 
 interface ChatActivity {
@@ -185,15 +211,13 @@ interface TaskItem {
   createdAt: string;
 }
 
-const seedMessages = [
-  "I prefer concise implementation plans. My project is Sedna Brain MVP.",
-  "Never upload .env files."
-];
-
 export function App() {
+  const initialRoute = useMemo(() => readRoute(), []);
   const [conversationId, setConversationId] = useState<string>();
+  const [conversations, setConversations] = useState<Conversation[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatActivities, setChatActivities] = useState<ChatActivity[]>([]);
+  const [chatRunInProgress, setChatRunInProgress] = useState(false);
   const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
   const [confirmations, setConfirmations] = useState<ConfirmationItem[]>([]);
   const [tasks, setTasks] = useState<TaskItem[]>([]);
@@ -201,8 +225,10 @@ export function App() {
   const [candidates, setCandidates] = useState<MemoryCandidate[]>([]);
   const [graph, setGraph] = useState<GraphResponse>({ nodes: [], edges: [], evidence: [] });
   const [workers, setWorkers] = useState<Worker[]>([]);
+  const [workerDetails, setWorkerDetails] = useState<WorkerDetailResponse[]>([]);
+  const [workerPairCode, setWorkerPairCode] = useState<string>("");
   const [audit, setAudit] = useState<AuditRecord[]>([]);
-  const [activeTab, setActiveTab] = useState<MainTab>("chat");
+  const [activeTab, setActiveTab] = useState<MainTab>(initialRoute.tab);
   const [graphView, setGraphView] = useState("Profile");
   const [draft, setDraft] = useState("");
   const [status, setStatus] = useState("Ready");
@@ -223,22 +249,47 @@ export function App() {
   const [tools, setTools] = useState<ToolRegistryResponse[]>([]);
   const [skills, setSkills] = useState<SkillResponse[]>([]);
   const [mcpDraft, setMcpDraft] = useState<McpServerDraft>(emptyMcpDraft());
-  const [skillDraft, setSkillDraft] = useState<SkillDraft>(emptySkillDraft());
   const [testResult, setTestResult] = useState<string>("");
+  const [webToolsSettings, setWebToolsSettings] = useState<WebToolsSettingsResponse | null>(null);
+  const [webToolsDraft, setWebToolsDraft] = useState<WebToolsDraft>(emptyWebToolsDraft());
+  const [webToolsTestResult, setWebToolsTestResult] = useState<string>("");
   const t = useMemo(() => createTranslator(settings.uiLocale), [settings.uiLocale]);
+  const onlineWorkerCount = workers.filter((worker) => worker.status === "online").length;
+
+  const refreshWorkers = useCallback(async () => {
+    const nextWorkers = (await getWorkers()).filter((worker) => worker.status !== "revoked");
+    setWorkers(nextWorkers);
+    const nextDetails = await Promise.all(nextWorkers.map((worker) => getWorkerDetail(worker.id)));
+    setWorkerDetails(nextDetails.sort((a, b) => {
+      if (a.worker.status === b.worker.status) {
+        return a.worker.displayName.localeCompare(b.worker.displayName);
+      }
+      return a.worker.status === "online" ? -1 : 1;
+    }));
+  }, []);
 
   const refresh = useCallback(async (id = conversationId, view = graphView) => {
-    const [nextTimeline, nextCandidates, nextGraph, nextWorkers, nextAudit] = await Promise.all([
+    const [nextConversations, nextTimeline, nextCandidates, nextGraph, nextWorkers, nextAudit] = await Promise.all([
+      getConversations(),
       getTimeline(),
       getCandidates(),
       getGraph(view),
       getWorkers(),
       getAudit()
     ]);
+    setConversations(nextConversations);
     setTimeline(nextTimeline);
     setCandidates(nextCandidates);
     setGraph(nextGraph);
-    setWorkers(nextWorkers);
+    const activeWorkers = nextWorkers.filter((worker) => worker.status !== "revoked");
+    setWorkers(activeWorkers);
+    const nextWorkerDetails = await Promise.all(activeWorkers.map((worker) => getWorkerDetail(worker.id)));
+    setWorkerDetails(nextWorkerDetails.sort((a, b) => {
+      if (a.worker.status === b.worker.status) {
+        return a.worker.displayName.localeCompare(b.worker.displayName);
+      }
+      return a.worker.status === "online" ? -1 : 1;
+    }));
     setAudit(nextAudit);
     if (id) {
       const conversation = await getConversation(id);
@@ -258,20 +309,25 @@ export function App() {
   }, []);
 
   const refreshRuntimeConfig = useCallback(async () => {
-    const [servers, registryTools, skillList] = await Promise.all([
+    const [servers, registryTools, skillList, webTools] = await Promise.all([
       getMcpServers(),
       getTools(),
-      getSkills()
+      getSkills(),
+      getWebToolsSettings()
     ]);
     setMcpServers(servers);
     setTools(registryTools);
     setSkills(skillList);
+    setWebToolsSettings(webTools);
+    setWebToolsDraft(toWebToolsDraft(webTools));
   }, []);
 
   useEffect(() => {
     async function boot() {
       try {
         setStatus(t("connecting"));
+        const route = readRoute();
+        setActiveTab(route.tab);
         const brainSettings = await getSettings();
         const nextSettings = {
           uiLocale: brainSettings.ui_locale,
@@ -283,14 +339,14 @@ export function App() {
         await refreshLlm();
         await refreshRuntimeConfig();
         const existing = await getConversations();
-        const conversation = existing[0] ?? await createConversation("Sedna Brain MVP");
+        let conversation = route.conversationId ? existing.find((item) => item.id === route.conversationId) : undefined;
+        conversation ??= existing[0] ?? await createConversation(createTranslator(nextSettings.uiLocale)("newConversation"));
+        const nextConversations = existing.some((item) => item.id === conversation.id) ? existing : [conversation, ...existing];
+        setConversations(nextConversations);
         setConversationId(conversation.id);
         const fullConversation = await getConversation(conversation.id);
-        if (fullConversation.messages.length === 0) {
-          for (const content of seedMessages) {
-            await sendMessage(conversation.id, content);
-          }
-        }
+        setMessages(fullConversation.messages);
+        writeRoute({ tab: route.tab, conversationId: route.tab === "chat" ? conversation.id : undefined }, "replace");
         await refresh(conversation.id);
         setStatus(createTranslator(nextSettings.uiLocale)("selfHosted"));
       } catch (error) {
@@ -299,6 +355,73 @@ export function App() {
     }
     void boot();
   }, []);
+
+  useEffect(() => {
+    function handlePopState() {
+      const route = readRoute();
+      setActiveTab(route.tab);
+      if (route.conversationId) {
+        void openConversation(route.conversationId, "replace");
+      }
+    }
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      void refreshWorkers();
+    }, 5000);
+    return () => window.clearInterval(interval);
+  }, [refreshWorkers]);
+
+  function navigateToTab(tab: MainTab) {
+    setActiveTab(tab);
+    writeRoute({ tab, conversationId: tab === "chat" ? conversationId : undefined });
+  }
+
+  async function openConversation(id: string, routeMode: "push" | "replace" = "push") {
+    setConversationId(id);
+    setActiveTab("chat");
+    setChatRunInProgress(false);
+    setChatActivities([]);
+    writeRoute({ tab: "chat", conversationId: id }, routeMode);
+    const conversation = await getConversation(id);
+    setMessages(conversation.messages);
+  }
+
+  async function handleNewConversation() {
+    const conversation = await createConversation(t("newConversation"));
+    setConversations((current) => [conversation, ...current]);
+    setMessages([]);
+    setChatActivities([]);
+    await openConversation(conversation.id);
+  }
+
+  async function handleRenameConversation(conversation: Conversation) {
+    const title = window.prompt(t("renameConversation"), conversation.title)?.trim();
+    if (!title || title === conversation.title) {
+      return;
+    }
+    const renamed = await renameConversation(conversation.id, title);
+    setConversations((current) => current.map((item) => item.id === renamed.id ? renamed : item));
+    setStatus(t("conversationRenamed"));
+  }
+
+  async function handleDeleteConversation(conversation: Conversation) {
+    if (!window.confirm(t("confirmDeleteConversation"))) {
+      return;
+    }
+    await deleteConversation(conversation.id);
+    const remaining = conversations.filter((item) => item.id !== conversation.id);
+    const nextConversation = remaining[0] ?? await createConversation(t("newConversation"));
+    const nextConversations = remaining.length > 0 ? remaining : [nextConversation];
+    setConversations(nextConversations);
+    setStatus(t("conversationDeleted"));
+    if (conversation.id === conversationId) {
+      await openConversation(nextConversation.id, "replace");
+    }
+  }
 
   async function submitMessage() {
     if (!conversationId || draft.trim().length === 0) {
@@ -314,7 +437,8 @@ export function App() {
     const confirmation = needsConfirmation ? createConfirmationForRun(run, now, t) : undefined;
     setDraft("");
     setStatus(t("sending"));
-    setChatActivities([{ id: "queued", title: t("queued") }]);
+    setChatActivities([]);
+    setChatRunInProgress(true);
     setAgentRuns((current) => [confirmation ? markRunWaiting(run, t) : run, ...current]);
     if (task) {
       setTasks((current) => [task, ...current]);
@@ -356,10 +480,30 @@ export function App() {
           }));
         }
         if (event.type === "assistant_status") {
-          setChatActivities((current) => [...current, { id: `${event.payload.phase}_${Date.now()}`, title: event.payload.title }]);
+          if (shouldShowAssistantStatus(event.payload.phase)) {
+            setChatActivities((current) => [...current, {
+              id: `${event.payload.phase}_${Date.now()}`,
+              title: event.payload.title
+            }]);
+          }
           if (event.payload.phase === "memory_extraction") {
             updateAgentRun(run.id, (currentRun) => addOrUpdateMemoryStep(currentRun, t));
           }
+        }
+        if (event.type === "tool_status") {
+          const title = buildToolActivityTitle(t, event.payload.tool, event.payload.phase, {
+            query: event.payload.query,
+            url: event.payload.url,
+            fallbackTitle: event.payload.title
+          });
+          setChatActivities((current) => [...current, { id: `tool_${event.payload.tool}_${Date.now()}`, title }]);
+          updateAgentRun(run.id, (currentRun) => ({
+            ...currentRun,
+            steps: updateStep(currentRun.steps, 0, {
+              status: "running",
+              observationSummary: title
+            })
+          }));
         }
         if (event.type === "assistant_delta") {
           setMessages((current) => current.map((message) =>
@@ -371,7 +515,11 @@ export function App() {
         if (event.type === "assistant_message") {
           setMessages((current) => current.map((message) =>
             message.id === assistantTempId
-              ? { ...event.payload.message, content: message.content || event.payload.message.content }
+              ? {
+                  ...event.payload.message,
+                  content: event.payload.message.content || message.content,
+                  metadata: { ...event.payload.message.metadata, pending: false }
+                }
               : message
           ));
           updateAgentRun(run.id, (currentRun) => ({
@@ -388,8 +536,12 @@ export function App() {
           setCandidates(event.payload.candidates);
           updateAgentRun(run.id, (currentRun) => addOrUpdateMemoryStep(currentRun, t, event.payload.candidates.length));
         }
+        if (event.type === "profile_attributes") {
+          void getGraph(graphView).then(setGraph);
+        }
         if (event.type === "error") {
           setStatus(`${t("messageFailed")}: ${event.payload.message}`);
+          setChatRunInProgress(false);
           updateAgentRun(run.id, (currentRun) => ({
             ...currentRun,
             status: "failed",
@@ -401,6 +553,7 @@ export function App() {
           }));
         }
         if (event.type === "done") {
+          setChatRunInProgress(false);
           updateAgentRun(run.id, (currentRun) => ({
             ...currentRun,
             status: currentRun.status === "waiting_confirmation" ? "waiting_confirmation" : "completed",
@@ -414,9 +567,11 @@ export function App() {
       });
       await refresh(conversationId);
       setChatActivities([]);
+      setChatRunInProgress(false);
       setStatus(t("selfHosted"));
     } catch (error) {
       setStatus(error instanceof Error ? `${t("messageFailed")}: ${error.message}` : t("messageFailed"));
+      setChatRunInProgress(false);
       setMessages((current) => current.filter((message) => message.id !== ownerTempId && message.id !== assistantTempId));
       setChatActivities([]);
       setDraft(content);
@@ -433,6 +588,95 @@ export function App() {
     await refresh();
   }
 
+  async function handleCreateWorkerPairCode() {
+    const pairCode = await createWorkerPairCode();
+    setWorkerPairCode(pairCode.code ?? "");
+  }
+
+  async function handleRevokeWorker(worker: Worker) {
+    if (!window.confirm(t("confirmRevokeWorker"))) {
+      return;
+    }
+    try {
+      await revokeWorker(worker.id);
+      setWorkers((current) => current.filter((item) => item.id !== worker.id));
+      setWorkerDetails((current) => current.filter((item) => item.worker.id !== worker.id));
+      setGraph(await getGraph(graphView));
+      setStatus(t("workerRevoked"));
+      void refreshWorkers();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : t("workerRevokeFailed"));
+    }
+  }
+
+  async function handlePatchWorkerCapability(
+    workerId: string,
+    capability: Capability,
+    patch: Partial<{ enabled: boolean; risk: RiskLevel; requires_confirmation: boolean }>
+  ) {
+    try {
+      const updated = await patchWorkerCapability(workerId, capability.id, patch);
+      setWorkerDetails((current) => current.map((detail) => detail.worker.id === workerId ? {
+        ...detail,
+        capabilities: detail.capabilities.map((item) => item.id === updated.id ? updated : item)
+      } : detail));
+      setStatus(t("workerPolicySaved"));
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : t("workerPolicySaveFailed"));
+    }
+  }
+
+  async function handleCreateWorkerPathScope(workerId: string, input: { label: string; path: string }) {
+    try {
+      const scope = await createWorkerPathScope(workerId, {
+        label: input.label,
+        path: input.path,
+        mode: "read_only",
+        enabled: true
+      });
+      setWorkerDetails((current) => current.map((detail) => detail.worker.id === workerId ? {
+        ...detail,
+        pathScopes: [...detail.pathScopes, scope]
+      } : detail));
+      setStatus(t("workerPolicySaved"));
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : t("workerPolicySaveFailed"));
+    }
+  }
+
+  async function handlePatchWorkerPathScope(
+    workerId: string,
+    scope: WorkerPathScope,
+    patch: Partial<{ label: string; path: string; enabled: boolean }>
+  ) {
+    try {
+      const updated = await patchWorkerPathScope(workerId, scope.id, patch);
+      setWorkerDetails((current) => current.map((detail) => detail.worker.id === workerId ? {
+        ...detail,
+        pathScopes: detail.pathScopes.map((item) => item.id === updated.id ? updated : item)
+      } : detail));
+      setStatus(t("workerPolicySaved"));
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : t("workerPolicySaveFailed"));
+    }
+  }
+
+  async function handleDeleteWorkerPathScope(workerId: string, scope: WorkerPathScope) {
+    if (!window.confirm(t("confirmDeleteWorkerPathScope"))) {
+      return;
+    }
+    try {
+      await deleteWorkerPathScope(workerId, scope.id);
+      setWorkerDetails((current) => current.map((detail) => detail.worker.id === workerId ? {
+        ...detail,
+        pathScopes: detail.pathScopes.filter((item) => item.id !== scope.id)
+      } : detail));
+      setStatus(t("workerPolicySaved"));
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : t("workerPolicySaveFailed"));
+    }
+  }
+
   async function handleEdit(candidate: MemoryCandidate) {
     const label = window.prompt(t("editMemoryLabel"), candidate.label);
     if (!label || label === candidate.label) {
@@ -440,13 +684,6 @@ export function App() {
     }
     await editCandidate(candidate.id, label);
     await refresh();
-  }
-
-  async function handleMockWorker() {
-    await registerMockWorker();
-    await refresh(undefined, "Worker");
-    setGraphView("Worker");
-    setActiveTab("graph");
   }
 
   async function handleSaveSettings() {
@@ -509,6 +746,36 @@ export function App() {
   async function handleTestProvider(provider: LlmProviderResponse) {
     const result = await testLlmProvider(provider.id);
     setTestResult(`${result.ok ? t("connectionPassed") : t("connectionFailed")}: ${result.message}`);
+  }
+
+  async function handleSaveWebTools() {
+    try {
+      const next = await patchWebToolsSettings({
+        enabled: webToolsDraft.enabled,
+        search_provider: webToolsDraft.searchProvider,
+        search_max_results: webToolsDraft.searchMaxResults,
+        fetch_max_chars: webToolsDraft.fetchMaxChars,
+        fetch_timeout_ms: webToolsDraft.fetchTimeoutMs,
+        searxng_url: webToolsDraft.searxngUrl.trim().length > 0 ? webToolsDraft.searxngUrl.trim() : null,
+        brave_api_key: webToolsDraft.braveApiKey.trim().length > 0 ? webToolsDraft.braveApiKey.trim() : undefined,
+        dashscope_api_key: webToolsDraft.dashscopeApiKey.trim().length > 0 ? webToolsDraft.dashscopeApiKey.trim() : undefined
+      });
+      setWebToolsSettings(next);
+      setWebToolsDraft(toWebToolsDraft(next));
+      setWebToolsTestResult("");
+      setStatus(t("webToolsSaved"));
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : t("webToolsSaveFailed"));
+    }
+  }
+
+  async function handleTestWebTools() {
+    try {
+      const result = await testWebToolsSettings("sedna personal assistant");
+      setWebToolsTestResult(`${result.ok ? t("connectionPassed") : t("connectionFailed")}: ${result.message}`);
+    } catch (error) {
+      setWebToolsTestResult(error instanceof Error ? error.message : t("connectionFailed"));
+    }
   }
 
   async function handlePatchRoute(purpose: LlmRoutePurpose, patch: Partial<{
@@ -588,17 +855,19 @@ export function App() {
     await refreshRuntimeConfig();
   }
 
-  async function handleSaveSkill() {
-    await createSkill({
-      name: skillDraft.name,
-      description: skillDraft.description,
-      instruction_markdown: skillDraft.instructionMarkdown,
-      required_tools: skillDraft.requiredTools.split(",").map((item) => item.trim()).filter(Boolean),
-      risk_level: skillDraft.riskLevel,
-      enabled: skillDraft.enabled
-    });
-    setSkillDraft(emptySkillDraft());
-    await refreshRuntimeConfig();
+  async function handleUploadSkills(file: File) {
+    const name = file.name.toLowerCase();
+    if (!name.endsWith(".zip") && file.type !== "application/zip" && file.type !== "application/x-zip-compressed") {
+      setStatus(t("skillUploadInvalidFile"));
+      return;
+    }
+    try {
+      const result = await uploadSkillsZip(file);
+      setTestResult(`${t("skillUploadSuccess")}: ${result.imported.map((skill) => skill.name).join(", ")}`);
+      await refreshRuntimeConfig();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : t("skillUploadFailed"));
+    }
   }
 
   async function handleToggleSkill(skill: SkillResponse) {
@@ -606,9 +875,8 @@ export function App() {
     await refreshRuntimeConfig();
   }
 
-  async function handleTestSkill(skill: SkillResponse) {
-    const result = await testSkillRun(skill.id, { goal: "Sedna skill smoke check" });
-    setTestResult(`${t("skillRunResult")}: ${result.status}`);
+  async function handleDeleteSkill(skill: SkillResponse) {
+    await deleteSkill(skill.id);
     await refreshRuntimeConfig();
   }
 
@@ -664,19 +932,20 @@ export function App() {
           </div>
         </div>
         <nav className="nav-list">
-          <NavItem icon={<MessageSquare size={17} />} label={t("navChat")} active={activeTab === "chat"} onClick={() => setActiveTab("chat")} />
-          <NavItem icon={<Inbox size={17} />} label={t("navMemory")} active={activeTab === "memory"} onClick={() => setActiveTab("memory")} />
-          <NavItem icon={<ClipboardList size={17} />} label={t("navTasks")} active={activeTab === "tasks"} onClick={() => setActiveTab("tasks")} />
-          <NavItem icon={<GitBranch size={17} />} label={t("navGraph")} active={activeTab === "graph"} onClick={() => setActiveTab("graph")} />
-          <NavItem icon={<Activity size={17} />} label={t("navAgents")} active={activeTab === "activity"} onClick={() => setActiveTab("activity")} />
-          <NavItem icon={<Database size={17} />} label={t("navAudit")} active={activeTab === "audit"} onClick={() => setActiveTab("audit")} />
-          <NavItem icon={<SettingsIcon size={17} />} label={t("navSettings")} active={activeTab === "settings"} onClick={() => setActiveTab("settings")} />
+          <NavItem icon={<MessageSquare size={17} />} label={t("navChat")} active={activeTab === "chat"} onClick={() => navigateToTab("chat")} />
+          <NavItem icon={<Inbox size={17} />} label={t("navMemory")} active={activeTab === "memory"} onClick={() => navigateToTab("memory")} />
+          <NavItem icon={<ClipboardList size={17} />} label={t("navTasks")} active={activeTab === "tasks"} onClick={() => navigateToTab("tasks")} />
+          <NavItem icon={<GitBranch size={17} />} label={t("navGraph")} active={activeTab === "graph"} onClick={() => navigateToTab("graph")} />
+          <NavItem icon={<Database size={17} />} label={t("navWorkers")} active={activeTab === "workers"} onClick={() => navigateToTab("workers")} />
+          <NavItem icon={<Activity size={17} />} label={t("navAgents")} active={activeTab === "activity"} onClick={() => navigateToTab("activity")} />
+          <NavItem icon={<Database size={17} />} label={t("navAudit")} active={activeTab === "audit"} onClick={() => navigateToTab("audit")} />
+          <NavItem icon={<SettingsIcon size={17} />} label={t("navSettings")} active={activeTab === "settings"} onClick={() => navigateToTab("settings")} />
         </nav>
         <div className="system-list">
           <span className="section-label">{t("system")}</span>
           <SystemRow label={t("graphDb")} />
           <SystemRow label={t("memoryInbox")} />
-          <SystemRow label={t("workers")} count={workers.length} />
+          <SystemRow label={t("workers")} count={onlineWorkerCount} />
         </div>
         <div className="policy-box">
           <ShieldCheck size={18} />
@@ -691,28 +960,39 @@ export function App() {
         <header className="topbar">
           <div className="status-pill"><Circle size={9} fill="currentColor" /> {status}</div>
           <div className="search">{t("searchPlaceholder")}</div>
-          <button className="ghost-button" onClick={handleMockWorker}><Plus size={16} /> {t("mockWorker")}</button>
           <div className="owner-chip"><UserRound size={16} /> {t("owner")}</div>
         </header>
 
         <section className="content-surface">
           {activeTab === "chat" && (
-            <ChatTimeline
-              messages={messages}
-              draft={draft}
-              setDraft={setDraft}
-              submitMessage={submitMessage}
-              t={t}
-              locale={settings.uiLocale}
-              activities={chatActivities}
-              agentRuns={agentRuns}
-              confirmations={confirmations}
-              tasks={tasks}
-              candidates={candidates}
-              onApproveConfirmation={handleApproveConfirmation}
-              onRejectConfirmation={handleRejectConfirmation}
-              onTaskStatus={handleTaskStatus}
-            />
+            <div className="chat-workspace">
+              <ConversationList
+                conversations={conversations}
+                activeConversationId={conversationId}
+                onNew={handleNewConversation}
+                onOpen={(id) => void openConversation(id)}
+                onRename={(conversation) => void handleRenameConversation(conversation)}
+                onDelete={(conversation) => void handleDeleteConversation(conversation)}
+                t={t}
+              />
+              <ChatTimeline
+                messages={messages}
+                draft={draft}
+                setDraft={setDraft}
+                submitMessage={submitMessage}
+                tools={tools}
+                skills={skills}
+                t={t}
+                locale={settings.uiLocale}
+                activities={chatActivities}
+                chatRunInProgress={chatRunInProgress}
+                confirmations={confirmations}
+                tasks={tasks}
+                onApproveConfirmation={handleApproveConfirmation}
+                onRejectConfirmation={handleRejectConfirmation}
+                onTaskStatus={handleTaskStatus}
+              />
+            </div>
           )}
           {activeTab === "memory" && (
             <section className="panel feature-panel">
@@ -735,6 +1015,20 @@ export function App() {
           )}
           {activeTab === "graph" && (
             <GraphPanel graph={graph} view={graphView} onChangeView={changeGraphView} t={t} />
+          )}
+          {activeTab === "workers" && (
+            <WorkerPanel
+              details={workerDetails}
+              pairCode={workerPairCode}
+              onCreatePairCode={() => void handleCreateWorkerPairCode()}
+              onRevokeWorker={(worker) => void handleRevokeWorker(worker)}
+              onPatchCapability={(workerId, capability, patch) => void handlePatchWorkerCapability(workerId, capability, patch)}
+              onCreatePathScope={(workerId, input) => void handleCreateWorkerPathScope(workerId, input)}
+              onPatchPathScope={(workerId, scope, patch) => void handlePatchWorkerPathScope(workerId, scope, patch)}
+              onDeletePathScope={(workerId, scope) => void handleDeleteWorkerPathScope(workerId, scope)}
+              t={t}
+              locale={settings.uiLocale}
+            />
           )}
           {activeTab === "activity" && (
             <AgentActivityPanel runs={agentRuns} confirmations={confirmations} t={t} locale={settings.uiLocale} />
@@ -764,9 +1058,7 @@ export function App() {
                 tools={tools}
                 skills={skills}
                 mcpDraft={mcpDraft}
-                skillDraft={skillDraft}
                 onMcpDraftChange={setMcpDraft}
-                onSkillDraftChange={setSkillDraft}
                 onSaveMcpServer={handleSaveMcpServer}
                 onEditMcpServer={handleEditMcpServer}
                 onDisableMcpServer={handleDisableMcpServer}
@@ -774,9 +1066,15 @@ export function App() {
                 onRefreshMcpServer={handleRefreshMcpServer}
                 onPatchTool={handlePatchTool}
                 onTestTool={handleTestTool}
-                onSaveSkill={handleSaveSkill}
+                onUploadSkills={handleUploadSkills}
                 onToggleSkill={handleToggleSkill}
-                onTestSkill={handleTestSkill}
+                onDeleteSkill={handleDeleteSkill}
+                webToolsDraft={webToolsDraft}
+                webToolsSettings={webToolsSettings}
+                onWebToolsDraftChange={setWebToolsDraft}
+                onSaveWebTools={handleSaveWebTools}
+                onTestWebTools={handleTestWebTools}
+                webToolsTestResult={webToolsTestResult}
                 t={t}
               />
             </section>
@@ -791,6 +1089,54 @@ function NavItem({ icon, label, active = false, onClick }: { icon: React.ReactNo
   return <button className={`nav-item ${active ? "active" : ""}`} onClick={onClick}>{icon}<span>{label}</span></button>;
 }
 
+function ConversationList({
+  conversations,
+  activeConversationId,
+  onNew,
+  onOpen,
+  onRename,
+  onDelete,
+  t
+}: {
+  conversations: Conversation[];
+  activeConversationId?: string;
+  onNew: () => void;
+  onOpen: (id: string) => void;
+  onRename: (conversation: Conversation) => void;
+  onDelete: (conversation: Conversation) => void;
+  t: (key: TranslationKey) => string;
+}) {
+  return (
+    <aside className="conversation-section chat-conversations-panel">
+      <div className="section-heading">
+        <span className="section-label">{t("conversations")}</span>
+        <button className="icon-button" onClick={onNew} title={t("newConversation")} aria-label={t("newConversation")}>
+          <Plus size={14} />
+        </button>
+      </div>
+      <div className="conversation-list">
+        {conversations.length === 0 && <div className="empty-sidebar-state">{t("noConversations")}</div>}
+        {conversations.map((conversation) => (
+          <div className={`conversation-row ${conversation.id === activeConversationId ? "active" : ""}`} key={conversation.id}>
+            <button className="conversation-open" onClick={() => onOpen(conversation.id)} title={conversation.title}>
+              <MessageSquare size={14} />
+              <span>{conversation.title}</span>
+            </button>
+            <div className="conversation-actions">
+              <button onClick={() => onRename(conversation)} title={t("renameConversation")} aria-label={t("renameConversation")}>
+                <Pencil size={13} />
+              </button>
+              <button onClick={() => onDelete(conversation)} title={t("deleteConversation")} aria-label={t("deleteConversation")}>
+                <Trash2 size={13} />
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </aside>
+  );
+}
+
 function SystemRow({ label, count }: { label: string; count?: number }) {
   return <div className="system-row"><span>{label}</span>{count !== undefined ? <strong>{count}</strong> : <Circle size={8} fill="currentColor" />}</div>;
 }
@@ -800,13 +1146,14 @@ function ChatTimeline({
   draft,
   setDraft,
   submitMessage,
+  tools,
+  skills,
   t,
   locale,
   activities,
-  agentRuns,
+  chatRunInProgress,
   confirmations,
   tasks,
-  candidates,
   onApproveConfirmation,
   onRejectConfirmation,
   onTaskStatus
@@ -815,29 +1162,73 @@ function ChatTimeline({
   draft: string;
   setDraft: (value: string) => void;
   submitMessage: () => void;
+  tools: ToolRegistryResponse[];
+  skills: SkillResponse[];
   t: (key: TranslationKey) => string;
   locale: UiLocale;
   activities: ChatActivity[];
-  agentRuns: AgentRun[];
+  chatRunInProgress: boolean;
   confirmations: ConfirmationItem[];
   tasks: TaskItem[];
-  candidates: MemoryCandidate[];
   onApproveConfirmation: (confirmation: ConfirmationItem) => void;
   onRejectConfirmation: (confirmation: ConfirmationItem) => void;
   onTaskStatus: (task: TaskItem, status: TaskStatus) => void;
 }) {
+  const isComposingRef = useRef(false);
   const messageListRef = useRef<HTMLDivElement>(null);
-  const timelineRuns = agentRuns.slice(0, 2);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [mentionOpen, setMentionOpen] = useState(false);
+  const [mentionStart, setMentionStart] = useState(0);
+  const [mentionQuery, setMentionQuery] = useState("");
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const visibleActivities = selectVisibleChatActivities(activities);
   const openConfirmations = confirmations.filter((item) => item.status === "pending").slice(0, 2);
-  const recentTasks = tasks.slice(0, 3);
-  const recentCandidates = candidates.slice(0, 2);
+  const suggestedTasks = chatRunInProgress
+    ? tasks.filter((task) => task.status === "suggested").slice(0, 1)
+    : [];
+  const showTimelineStack = openConfirmations.length > 0 || suggestedTasks.length > 0;
+  const mentionOptions = useMemo(
+    () => buildMentionOptions(mentionQuery, skills, tools),
+    [mentionQuery, skills, tools]
+  );
 
   useEffect(() => {
     const list = messageListRef.current;
     if (list) {
       list.scrollTop = list.scrollHeight;
     }
-  }, [messages.length, activities.length]);
+  }, [messages.length, visibleActivities.length]);
+
+  useEffect(() => {
+    setMentionIndex(0);
+  }, [mentionQuery, mentionOpen]);
+
+  function syncMentionState(value: string, cursor: number) {
+    const active = getActiveMention(value, cursor);
+    if (!active) {
+      setMentionOpen(false);
+      setMentionQuery("");
+      return;
+    }
+    setMentionOpen(true);
+    setMentionStart(active.start);
+    setMentionQuery(active.query);
+  }
+
+  function applyMention(option: MentionOption) {
+    const textarea = textareaRef.current;
+    const cursor = textarea?.selectionStart ?? draft.length;
+    const token = option.kind === "skill" ? `@skill:${option.name}` : `@tool:${option.name}`;
+    const nextDraft = `${draft.slice(0, mentionStart)}${token} ${draft.slice(cursor)}`;
+    const nextCursor = mentionStart + token.length + 1;
+    setDraft(nextDraft);
+    setMentionOpen(false);
+    setMentionQuery("");
+    requestAnimationFrame(() => {
+      textarea?.focus();
+      textarea?.setSelectionRange(nextCursor, nextCursor);
+    });
+  }
 
   return (
     <section className="panel chat-panel">
@@ -851,22 +1242,33 @@ function ChatTimeline({
             <div className="avatar">{message.role === "assistant" ? <Bot size={18} /> : "OS"}</div>
             <div>
               <div className="message-meta"><strong>{message.role === "assistant" ? t("sednaBrain") : t("owner")}</strong><span>{new Date(message.createdAt).toLocaleTimeString(locale)}</span></div>
-              <p>{message.content}{message.metadata.pending === true ? <span className="stream-caret" /> : null}</p>
-              {message.role === "assistant" && message.metadata.pending === true && activities.length > 0 && (
-                <div className="agent-steps">
-                  {activities.slice(-4).map((activity) => (
-                    <span key={activity.id}>{activity.title}</span>
+              <div className="message-body">
+                {message.role === "assistant"
+                  ? (
+                      <>
+                        <MessageMarkdown content={message.content} />
+                        {message.metadata.pending === true ? <span className="stream-caret" /> : null}
+                      </>
+                    )
+                  : <p>{message.content}</p>}
+              </div>
+              {message.role === "assistant" && message.metadata.pending === true && visibleActivities.length > 0 && (
+                <div className="agent-steps" aria-live="polite">
+                  {visibleActivities.map((activity, index) => (
+                    <span
+                      key={activity.id}
+                      className={index === visibleActivities.length - 1 ? "active" : undefined}
+                    >
+                      {activity.title}
+                    </span>
                   ))}
                 </div>
               )}
             </div>
           </article>
         ))}
-        {(timelineRuns.length > 0 || openConfirmations.length > 0 || recentTasks.length > 0 || recentCandidates.length > 0) && (
+        {showTimelineStack && (
           <div className="timeline-card-stack" aria-label={t("agentTimelineUpdates")}>
-            {timelineRuns.map((run) => (
-              <AgentRunSummaryCard run={run} key={run.id} t={t} locale={locale} />
-            ))}
             {openConfirmations.map((confirmation) => (
               <ConfirmationCard
                 confirmation={confirmation}
@@ -876,26 +1278,86 @@ function ChatTimeline({
                 t={t}
               />
             ))}
-            {recentTasks.map((task) => (
+            {suggestedTasks.map((task) => (
               <TaskCard task={task} key={task.id} onTaskStatus={onTaskStatus} t={t} locale={locale} compact />
-            ))}
-            {recentCandidates.map((candidate) => (
-              <MemoryCandidateCard candidate={candidate} key={candidate.id} t={t} />
             ))}
           </div>
         )}
       </div>
       <div className="composer">
-        <textarea
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+        <div className="composer-input">
+          {mentionOpen && mentionOptions.length > 0 && (
+            <div className="mention-picker" role="listbox">
+              {mentionOptions.map((option, index) => (
+                <button
+                  type="button"
+                  key={`${option.kind}:${option.name}`}
+                  className={`mention-option${index === mentionIndex ? " active" : ""}`}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    applyMention(option);
+                  }}
+                >
+                  <strong>{option.kind === "skill" ? t("mentionSkills") : t("mentionTools")} · {option.label}</strong>
+                  <span>{option.description || option.name}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          <textarea
+            ref={textareaRef}
+            value={draft}
+            onChange={(event) => {
+              setDraft(event.target.value);
+              syncMentionState(event.target.value, event.target.selectionStart ?? event.target.value.length);
+            }}
+            onClick={(event) => {
+              syncMentionState(event.currentTarget.value, event.currentTarget.selectionStart ?? event.currentTarget.value.length);
+            }}
+            onKeyUp={(event) => {
+              syncMentionState(event.currentTarget.value, event.currentTarget.selectionStart ?? event.currentTarget.value.length);
+            }}
+            onCompositionStart={() => {
+              isComposingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              isComposingRef.current = false;
+            }}
+            onKeyDown={(event) => {
+              if (mentionOpen && mentionOptions.length > 0) {
+                if (event.key === "ArrowDown") {
+                  event.preventDefault();
+                  setMentionIndex((current) => (current + 1) % mentionOptions.length);
+                  return;
+                }
+                if (event.key === "ArrowUp") {
+                  event.preventDefault();
+                  setMentionIndex((current) => (current - 1 + mentionOptions.length) % mentionOptions.length);
+                  return;
+                }
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  applyMention(mentionOptions[mentionIndex]);
+                  return;
+                }
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  setMentionOpen(false);
+                  return;
+                }
+              }
+              if (event.key !== "Enter" || event.shiftKey) {
+                return;
+              }
+              if (event.nativeEvent.isComposing || isComposingRef.current || event.keyCode === 229) {
+                return;
+              }
+              event.preventDefault();
               void submitMessage();
-            }
-          }}
-          placeholder={t("messagePlaceholder")}
-        />
+            }}
+            placeholder={t("messagePlaceholderWithMention")}
+          />
+        </div>
         <button className="send-button" onClick={() => void submitMessage()} aria-label={t("sendMessage")} title={t("sendMessage")}><Send size={18} /></button>
       </div>
     </section>
@@ -928,7 +1390,7 @@ function MemoryInbox({
           <div className="candidate-row" key={candidate.id}>
             <div>
               <strong>{candidate.label}</strong>
-              <small>{candidate.kind} · {t("source")}: {sourceLabel(candidate)}</small>
+              <small>{memoryKindLabel(candidate.kind, t)} · {t("source")}: {sourceLabel(candidate)}</small>
               {firstEvidence?.quote && <blockquote>{firstEvidence.quote}</blockquote>}
             </div>
             <div className="confidence"><span style={{ width: `${candidate.confidence * 100}%` }} />{candidate.confidence.toFixed(2)}</div>
@@ -953,6 +1415,14 @@ function RiskBadge({ risk, t }: { risk: string; t: (key: TranslationKey) => stri
 
 function GraphPanel({ graph, view, onChangeView, t, compact = false }: { graph: GraphResponse; view: string; onChangeView: (view: string) => void; t: (key: TranslationKey) => string; compact?: boolean }) {
   const flow = useMemo(() => toFlow(graph), [graph]);
+  const evidenceById = useMemo(() => new Map(graph.evidence.map((item) => [item.id, item])), [graph.evidence]);
+  const detailNodes = useMemo(() => {
+    const profileAttributes = graph.nodes.filter((node) => node.type === "profile_attribute");
+    if (profileAttributes.length > 0) {
+      return profileAttributes;
+    }
+    return graph.nodes.filter((node) => node.type !== "owner" && node.type !== "owner_profile").slice(0, 6);
+  }, [graph.nodes]);
   return (
     <section className={`panel graph-panel ${compact ? "compact" : ""}`}>
       <div className="panel-header">
@@ -971,18 +1441,306 @@ function GraphPanel({ graph, view, onChangeView, t, compact = false }: { graph: 
         </ReactFlow>
       </div>
       <div className="graph-detail-list">
-        {graph.nodes.slice(0, 4).map((node) => (
-          <div className="graph-detail-row" key={node.id}>
-            <strong>{node.label}</strong>
-            <span>{node.type} · {t("sourceRun")}: {String(node.payload.sourceRunId ?? node.origin)}</span>
-          </div>
-        ))}
-        {graph.evidence.slice(0, 2).map((item) => (
-          <blockquote key={item.id}>{item.quote ?? item.sourceId}</blockquote>
-        ))}
+        {detailNodes.map((node) => {
+          const latestEvidenceId = typeof node.payload.latestEvidenceId === "string" ? node.payload.latestEvidenceId : undefined;
+          const evidenceQuote = latestEvidenceId ? evidenceById.get(latestEvidenceId)?.quote : undefined;
+          return (
+            <div className="graph-detail-row" key={node.id}>
+              <strong>{node.label}</strong>
+              <span>{node.type} · {t("confidence")}: {node.confidence.toFixed(2)}</span>
+              {evidenceQuote && <blockquote>{evidenceQuote}</blockquote>}
+            </div>
+          );
+        })}
       </div>
       <footer className="panel-footer">{t("nodes")}: {graph.nodes.length} · {t("edges")}: {graph.edges.length} · {t("evidence")}: {graph.evidence.length}</footer>
     </section>
+  );
+}
+
+function WorkerPanel({
+  details,
+  pairCode,
+  onCreatePairCode,
+  onRevokeWorker,
+  onPatchCapability,
+  onCreatePathScope,
+  onPatchPathScope,
+  onDeletePathScope,
+  t,
+  locale
+}: {
+  details: WorkerDetailResponse[];
+  pairCode: string;
+  onCreatePairCode: () => void;
+  onRevokeWorker: (worker: Worker) => void;
+  onPatchCapability: (
+    workerId: string,
+    capability: Capability,
+    patch: Partial<{ enabled: boolean; risk: RiskLevel; requires_confirmation: boolean }>
+  ) => void;
+  onCreatePathScope: (workerId: string, input: { label: string; path: string }) => void;
+  onPatchPathScope: (workerId: string, scope: WorkerPathScope, patch: Partial<{ label: string; path: string; enabled: boolean }>) => void;
+  onDeletePathScope: (workerId: string, scope: WorkerPathScope) => void;
+  t: (key: TranslationKey) => string;
+  locale: UiLocale;
+}) {
+  const activeDetails = details.filter((detail) => detail.worker.status !== "revoked");
+  return (
+    <section className="panel feature-panel worker-panel">
+      <div className="panel-header">
+        <h1>{t("workers")}</h1>
+        <button className="ghost-button" onClick={onCreatePairCode}><Plus size={15} /> {t("createPairCode")}</button>
+      </div>
+      <div className="worker-panel-intro">{t("workerPolicyHint")}</div>
+      {pairCode && (
+        <div className="pair-code-box">
+          <span>{t("pairCode")}</span>
+          <strong>{pairCode}</strong>
+        </div>
+      )}
+      <div className="worker-grid">
+        {activeDetails.length === 0 && <div className="empty-state">{t("noWorkers")}</div>}
+        {activeDetails.map((detail) => (
+          <WorkerCard
+            detail={detail}
+            key={detail.worker.id}
+            onRevokeWorker={onRevokeWorker}
+            onPatchCapability={onPatchCapability}
+            onCreatePathScope={onCreatePathScope}
+            onPatchPathScope={onPatchPathScope}
+            onDeletePathScope={onDeletePathScope}
+            t={t}
+            locale={locale}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function WorkerCard({
+  detail,
+  onRevokeWorker,
+  onPatchCapability,
+  onCreatePathScope,
+  onPatchPathScope,
+  onDeletePathScope,
+  t,
+  locale
+}: {
+  detail: WorkerDetailResponse;
+  onRevokeWorker: (worker: Worker) => void;
+  onPatchCapability: (
+    workerId: string,
+    capability: Capability,
+    patch: Partial<{ enabled: boolean; risk: RiskLevel; requires_confirmation: boolean }>
+  ) => void;
+  onCreatePathScope: (workerId: string, input: { label: string; path: string }) => void;
+  onPatchPathScope: (workerId: string, scope: WorkerPathScope, patch: Partial<{ label: string; path: string; enabled: boolean }>) => void;
+  onDeletePathScope: (workerId: string, scope: WorkerPathScope) => void;
+  t: (key: TranslationKey) => string;
+  locale: UiLocale;
+}) {
+  const { worker } = detail;
+  const [pathDraft, setPathDraft] = useState({ label: "", path: "" });
+  return (
+    <article className={`worker-card ${worker.status}`}>
+      <div className="worker-card-header">
+        <div>
+          <strong>{worker.displayName}</strong>
+          <span>{worker.environment}{worker.hostName ? ` · ${worker.hostName}` : ""}</span>
+        </div>
+        <div className="worker-actions">
+          <span className={`status-badge ${worker.status}`}>{worker.status}</span>
+          {worker.status !== "revoked" && (
+            <button className="icon-button danger" onClick={() => onRevokeWorker(worker)} title={t("revokeWorker")} aria-label={t("revokeWorker")}>
+              <X size={14} />
+            </button>
+          )}
+        </div>
+      </div>
+      <div className="worker-meta">
+        <span>{t("lastHeartbeat")}: {worker.lastSeenAt ? new Date(worker.lastSeenAt).toLocaleString(locale) : t("unknown")}</span>
+        {worker.os && <span>{t("os")}: {worker.os}</span>}
+      </div>
+      <WorkerSection title={t("capabilities")} stack>
+        {detail.capabilities.length === 0 && <span className="muted-text">{t("none")}</span>}
+        {detail.capabilities.map((capability) => (
+          <WorkerCapabilityRow
+            capability={capability}
+            key={capability.id}
+            onPatch={(patch) => onPatchCapability(worker.id, capability, patch)}
+            t={t}
+          />
+        ))}
+      </WorkerSection>
+      <WorkerSection title={t("allowedPaths")} stack>
+        {detail.pathScopes.length === 0 && <span className="muted-text">{t("noAllowedPaths")}</span>}
+        {detail.pathScopes.map((scope) => (
+          <WorkerPathScopeRow
+            key={scope.id}
+            onDelete={() => onDeletePathScope(worker.id, scope)}
+            onPatch={(patch) => onPatchPathScope(worker.id, scope, patch)}
+            scope={scope}
+            t={t}
+          />
+        ))}
+        <form
+          className="worker-path-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const label = pathDraft.label.trim();
+            const pathValue = pathDraft.path.trim();
+            if (!label || !pathValue) {
+              return;
+            }
+            onCreatePathScope(worker.id, { label, path: pathValue });
+            setPathDraft({ label: "", path: "" });
+          }}
+        >
+          <input
+            placeholder={t("pathScopeLabel")}
+            value={pathDraft.label}
+            onChange={(event) => setPathDraft((current) => ({ ...current, label: event.target.value }))}
+          />
+          <input
+            placeholder={t("pathScopePath")}
+            value={pathDraft.path}
+            onChange={(event) => setPathDraft((current) => ({ ...current, path: event.target.value }))}
+          />
+          <button className="ghost-button" type="submit"><Plus size={14} /> {t("addPathScope")}</button>
+        </form>
+      </WorkerSection>
+      <WorkerSection title={t("recentJobs")} stack>
+        {detail.recentJobs.length === 0 && <span className="muted-text">{t("noWorkerJobs")}</span>}
+        {detail.recentJobs.slice(0, 6).map((job) => <WorkerJobRow job={job} key={job.id} t={t} locale={locale} />)}
+      </WorkerSection>
+    </article>
+  );
+}
+
+function WorkerCapabilityRow({
+  capability,
+  onPatch,
+  t
+}: {
+  capability: Capability;
+  onPatch: (patch: Partial<{ enabled: boolean; risk: RiskLevel; requires_confirmation: boolean }>) => void;
+  t: (key: TranslationKey) => string;
+}) {
+  return (
+    <div className="worker-capability-row">
+      <div>
+        <strong>{capability.name}</strong>
+        <span>{capability.readOnly ? t("readOnly") : t("readWrite")}</span>
+      </div>
+      <select
+        value={capability.risk}
+        onChange={(event) => onPatch({ risk: event.target.value as RiskLevel })}
+      >
+        <option value="low">{t("low")}</option>
+        <option value="medium">{t("medium")}</option>
+        <option value="high">{t("high")}</option>
+      </select>
+      <label className="route-enabled">
+        <input
+          checked={capability.requiresConfirmation}
+          onChange={(event) => onPatch({ requires_confirmation: event.target.checked })}
+          type="checkbox"
+        />
+        {t("requiresConfirmation")}
+      </label>
+      <label className="route-enabled">
+        <input
+          checked={capability.enabled}
+          onChange={(event) => onPatch({ enabled: event.target.checked })}
+          type="checkbox"
+        />
+        {t("enabled")}
+      </label>
+    </div>
+  );
+}
+
+function WorkerPathScopeRow({
+  scope,
+  onPatch,
+  onDelete,
+  t
+}: {
+  scope: WorkerPathScope;
+  onPatch: (patch: Partial<{ label: string; path: string; enabled: boolean }>) => void;
+  onDelete: () => void;
+  t: (key: TranslationKey) => string;
+}) {
+  const [label, setLabel] = useState(scope.label);
+  const [pathValue, setPathValue] = useState(scope.path);
+
+  useEffect(() => {
+    setLabel(scope.label);
+    setPathValue(scope.path);
+  }, [scope.label, scope.path]);
+
+  return (
+    <div className="worker-path-scope-row">
+      <input
+        value={label}
+        onChange={(event) => setLabel(event.target.value)}
+        onBlur={() => {
+          const next = label.trim();
+          if (next && next !== scope.label) {
+            onPatch({ label: next });
+          }
+        }}
+      />
+      <input
+        value={pathValue}
+        onChange={(event) => setPathValue(event.target.value)}
+        onBlur={() => {
+          const next = pathValue.trim();
+          if (next && next !== scope.path) {
+            onPatch({ path: next });
+          }
+        }}
+      />
+      <label className="route-enabled">
+        <input
+          checked={scope.enabled}
+          onChange={(event) => onPatch({ enabled: event.target.checked })}
+          type="checkbox"
+        />
+        {t("enabled")}
+      </label>
+      <button className="icon-button danger" onClick={onDelete} title={t("deletePathScope")} aria-label={t("deletePathScope")} type="button">
+        <Trash2 size={14} />
+      </button>
+    </div>
+  );
+}
+
+function WorkerSection({ title, children, stack = false }: { title: string; children: React.ReactNode; stack?: boolean }) {
+  return (
+    <div className="worker-section">
+      <span className="section-label">{title}</span>
+      <div className={stack ? "worker-config-list" : undefined}>{children}</div>
+    </div>
+  );
+}
+
+function WorkerJobRow({ job, t, locale }: { job: WorkerJob; t: (key: TranslationKey) => string; locale: UiLocale }) {
+  return (
+    <details className={`worker-job-row ${job.status}`}>
+      <summary>
+        <span>{job.capability}</span>
+        <span className={`status-badge ${job.status}`}>{job.status}</span>
+      </summary>
+      <div className="worker-job-detail">
+        <small>{t("createdAt")}: {new Date(job.createdAt).toLocaleString(locale)}</small>
+        {job.error && <p className="error-text">{job.error}</p>}
+        {job.result && <pre>{JSON.stringify(job.result, null, 2)}</pre>}
+      </div>
+    </details>
   );
 }
 
@@ -1065,20 +1823,6 @@ function Field({ label, value, tone }: { label: string; value: string; tone?: "d
   return <div className={`field-row ${tone ?? ""}`}><span>{label}</span><p>{value}</p></div>;
 }
 
-function AgentRunSummaryCard({ run, t, locale }: { run: AgentRun; t: (key: TranslationKey) => string; locale: UiLocale }) {
-  const latestStep = run.steps[run.steps.length - 1];
-  return (
-    <article className={`workbench-card run-summary ${run.status}`}>
-      <div className="card-icon"><Activity size={16} /></div>
-      <div>
-        <div className="card-line"><strong>{t("agentRun")}</strong><RunStatusBadge status={run.status} t={t} /></div>
-        <p>{latestStep?.thoughtSummary ?? run.title}</p>
-        <small>{new Date(run.startedAt).toLocaleTimeString(locale)} · {run.steps.length} {t("steps")}</small>
-      </div>
-    </article>
-  );
-}
-
 function ConfirmationCard({ confirmation, onApprove, onReject, t }: { confirmation: ConfirmationItem; onApprove: (confirmation: ConfirmationItem) => void; onReject: (confirmation: ConfirmationItem) => void; t: (key: TranslationKey) => string }) {
   return (
     <article className="workbench-card confirmation-card">
@@ -1091,19 +1835,6 @@ function ConfirmationCard({ confirmation, onApprove, onReject, t }: { confirmati
           <button onClick={() => onApprove(confirmation)}><Check size={14} /> {t("approve")}</button>
           <button onClick={() => onReject(confirmation)}><X size={14} /> {t("reject")}</button>
         </div>
-      </div>
-    </article>
-  );
-}
-
-function MemoryCandidateCard({ candidate, t }: { candidate: MemoryCandidate; t: (key: TranslationKey) => string }) {
-  return (
-    <article className="workbench-card">
-      <div className="card-icon"><Inbox size={16} /></div>
-      <div>
-        <div className="card-line"><strong>{t("memoryCandidateCreated")}</strong><RiskBadge risk={candidate.risk} t={t} /></div>
-        <p>{candidate.label}</p>
-        <small>{t("confidence")}: {candidate.confidence.toFixed(2)}</small>
       </div>
     </article>
   );
@@ -1169,6 +1900,65 @@ function AuditPanel({ audit, t, locale }: { audit: AuditRecord[]; t: (key: Trans
   );
 }
 
+function SettingsSectionHeader({
+  title,
+  actionLabel,
+  onAction
+}: {
+  title: string;
+  actionLabel?: string;
+  onAction?: () => void;
+}) {
+  return (
+    <div className="settings-section-header">
+      <h2>{title}</h2>
+      {actionLabel && onAction && (
+        <button type="button" className="primary-button settings-add-button" onClick={onAction}>
+          {actionLabel}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function SettingsModal({
+  open,
+  title,
+  onClose,
+  children,
+  footer
+}: {
+  open: boolean;
+  title: string;
+  onClose: () => void;
+  children: ReactNode;
+  footer?: ReactNode;
+}) {
+  if (!open) {
+    return null;
+  }
+  return (
+    <div className="settings-modal-overlay" onClick={onClose}>
+      <div
+        className="settings-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="settings-modal-header">
+          <h3>{title}</h3>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Close">
+            <X size={16} />
+          </button>
+        </div>
+        <div className="settings-modal-body">{children}</div>
+        {footer && <div className="settings-modal-footer settings-actions">{footer}</div>}
+      </div>
+    </div>
+  );
+}
+
 function SettingsPanel({
   settings,
   onChange,
@@ -1189,9 +1979,7 @@ function SettingsPanel({
   tools,
   skills,
   mcpDraft,
-  skillDraft,
   onMcpDraftChange,
-  onSkillDraftChange,
   onSaveMcpServer,
   onEditMcpServer,
   onDisableMcpServer,
@@ -1199,9 +1987,15 @@ function SettingsPanel({
   onRefreshMcpServer,
   onPatchTool,
   onTestTool,
-  onSaveSkill,
+  onUploadSkills,
   onToggleSkill,
-  onTestSkill,
+  onDeleteSkill,
+  webToolsDraft,
+  webToolsSettings,
+  onWebToolsDraftChange,
+  onSaveWebTools,
+  onTestWebTools,
+  webToolsTestResult,
   t
 }: {
   settings: LanguageSettings;
@@ -1229,9 +2023,7 @@ function SettingsPanel({
   tools: ToolRegistryResponse[];
   skills: SkillResponse[];
   mcpDraft: McpServerDraft;
-  skillDraft: SkillDraft;
   onMcpDraftChange: (draft: McpServerDraft) => void;
-  onSkillDraftChange: (draft: SkillDraft) => void;
   onSaveMcpServer: () => void;
   onEditMcpServer: (server: McpServerResponse) => void;
   onDisableMcpServer: (server: McpServerResponse) => void;
@@ -1243,11 +2035,59 @@ function SettingsPanel({
     enabled: boolean;
   }>) => void;
   onTestTool: (tool: ToolRegistryResponse) => void;
-  onSaveSkill: () => void;
+  onUploadSkills: (file: File) => void;
   onToggleSkill: (skill: SkillResponse) => void;
-  onTestSkill: (skill: SkillResponse) => void;
+  onDeleteSkill: (skill: SkillResponse) => void;
+  webToolsDraft: WebToolsDraft;
+  webToolsSettings: WebToolsSettingsResponse | null;
+  onWebToolsDraftChange: (draft: WebToolsDraft) => void;
+  onSaveWebTools: () => void;
+  onTestWebTools: () => void;
+  webToolsTestResult: string;
   t: (key: TranslationKey) => string;
 }) {
+  const [providerModalOpen, setProviderModalOpen] = useState(false);
+  const [webToolsModalOpen, setWebToolsModalOpen] = useState(false);
+
+  function openAddProvider() {
+    onProviderDraftChange(emptyProviderDraft());
+    setProviderModalOpen(true);
+  }
+
+  function openEditProvider(provider: LlmProviderResponse) {
+    void onEditProvider(provider);
+    setProviderModalOpen(true);
+  }
+
+  function closeProviderModal() {
+    setProviderModalOpen(false);
+    onProviderDraftChange(emptyProviderDraft());
+  }
+
+  async function saveProviderFromModal() {
+    await onSaveProvider();
+    setProviderModalOpen(false);
+  }
+
+  function openWebToolsModal() {
+    if (webToolsSettings) {
+      onWebToolsDraftChange(toWebToolsDraft(webToolsSettings));
+    }
+    setWebToolsModalOpen(true);
+  }
+
+  function closeWebToolsModal() {
+    if (webToolsSettings) {
+      onWebToolsDraftChange(toWebToolsDraft(webToolsSettings));
+    }
+    setWebToolsModalOpen(false);
+  }
+
+  async function saveWebToolsFromModal() {
+    await onSaveWebTools();
+    setWebToolsModalOpen(false);
+  }
+
   return (
     <section className="settings-panel">
       <div className="settings-section">
@@ -1281,67 +2121,76 @@ function SettingsPanel({
       </div>
 
       <div className="settings-section llm-settings">
-        <h2>{t("llmConfiguration")}</h2>
+        <SettingsSectionHeader title={t("llmConfiguration")} actionLabel={t("addProvider")} onAction={openAddProvider} />
         <div className="settings-copy">{t("llmPrivacyNote")}</div>
 
-        <div className="provider-editor">
-          <label>
-            <span>{t("providerPreset")}</span>
-            <select
-              value={providerDraft.presetId ?? ""}
-              onChange={(event) => {
-                const preset = providerPresets.find((item) => item.id === event.target.value);
-                onProviderDraftChange(preset ? {
-                  ...providerDraft,
-                  presetId: preset.id,
-                  displayName: preset.display_name,
-                  adapterType: preset.adapter_type,
-                  baseUrl: preset.base_url ?? "",
-                  defaultModel: preset.default_model
-                } : { ...providerDraft, presetId: undefined });
-              }}
-            >
-              <option value="">{t("addProvider")}</option>
-              {providerPresets.map((preset) => (
-                <option value={preset.id} key={preset.id}>{preset.display_name}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            <span>{t("displayName")}</span>
-            <input value={providerDraft.displayName} onChange={(event) => onProviderDraftChange({ ...providerDraft, displayName: event.target.value })} />
-          </label>
-          <label>
-            <span>{t("adapterType")}</span>
-            <select value={providerDraft.adapterType} onChange={(event) => onProviderDraftChange({ ...providerDraft, adapterType: event.target.value as LlmAdapterType })}>
-              <option value="mock">mock</option>
-              <option value="openai-compatible">openai-compatible</option>
-              <option value="openai-native">openai-native</option>
-              <option value="anthropic">anthropic</option>
-              <option value="gemini">gemini</option>
-            </select>
-          </label>
-          <label>
-            <span>{t("baseUrl")}</span>
-            <input value={providerDraft.baseUrl} onChange={(event) => onProviderDraftChange({ ...providerDraft, baseUrl: event.target.value })} />
-          </label>
-          <label>
-            <span>{t("apiKey")}</span>
-            <input type="password" placeholder={t("apiKeyPlaceholder")} value={providerDraft.apiKey} onChange={(event) => onProviderDraftChange({ ...providerDraft, apiKey: event.target.value })} />
-          </label>
-          <label>
-            <span>{t("defaultModel")}</span>
-            <input value={providerDraft.defaultModel} onChange={(event) => onProviderDraftChange({ ...providerDraft, defaultModel: event.target.value })} />
-          </label>
-          <label className="checkbox-row">
-            <input type="checkbox" checked={providerDraft.enabled} onChange={(event) => onProviderDraftChange({ ...providerDraft, enabled: event.target.checked })} />
-            <span>{t("enabled")}</span>
-          </label>
-          <div className="settings-actions">
-            <button className="ghost-button" onClick={() => onProviderDraftChange(emptyProviderDraft())}>{t("cancel")}</button>
-            <button className="primary-button" onClick={() => void onSaveProvider()}>{providerDraft.id ? t("save") : t("addProvider")}</button>
+        <SettingsModal
+          open={providerModalOpen}
+          title={providerDraft.id ? t("editProvider") : t("addProvider")}
+          onClose={closeProviderModal}
+          footer={(
+            <>
+              <button type="button" className="ghost-button" onClick={closeProviderModal}>{t("cancel")}</button>
+              <button type="button" className="primary-button" onClick={() => void saveProviderFromModal()}>
+                {providerDraft.id ? t("save") : t("addProvider")}
+              </button>
+            </>
+          )}
+        >
+          <div className="provider-editor">
+            <label>
+              <span>{t("providerPreset")}</span>
+              <select
+                value={providerDraft.presetId ?? ""}
+                onChange={(event) => {
+                  const preset = providerPresets.find((item) => item.id === event.target.value);
+                  onProviderDraftChange(preset ? {
+                    ...providerDraft,
+                    presetId: preset.id,
+                    displayName: preset.display_name,
+                    adapterType: preset.adapter_type,
+                    baseUrl: preset.base_url ?? "",
+                    defaultModel: preset.default_model
+                  } : { ...providerDraft, presetId: undefined });
+                }}
+              >
+                <option value="">{t("addProvider")}</option>
+                {providerPresets.map((preset) => (
+                  <option value={preset.id} key={preset.id}>{preset.display_name}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>{t("displayName")}</span>
+              <input value={providerDraft.displayName} onChange={(event) => onProviderDraftChange({ ...providerDraft, displayName: event.target.value })} />
+            </label>
+            <label>
+              <span>{t("adapterType")}</span>
+              <select value={providerDraft.adapterType} onChange={(event) => onProviderDraftChange({ ...providerDraft, adapterType: event.target.value as LlmAdapterType })}>
+                <option value="openai-compatible">openai-compatible</option>
+                <option value="openai-native">openai-native</option>
+                <option value="anthropic">anthropic</option>
+                <option value="gemini">gemini</option>
+              </select>
+            </label>
+            <label>
+              <span>{t("baseUrl")}</span>
+              <input value={providerDraft.baseUrl} onChange={(event) => onProviderDraftChange({ ...providerDraft, baseUrl: event.target.value })} />
+            </label>
+            <label>
+              <span>{t("apiKey")}</span>
+              <input type="password" placeholder={t("apiKeyPlaceholder")} value={providerDraft.apiKey} onChange={(event) => onProviderDraftChange({ ...providerDraft, apiKey: event.target.value })} />
+            </label>
+            <label>
+              <span>{t("defaultModel")}</span>
+              <input value={providerDraft.defaultModel} onChange={(event) => onProviderDraftChange({ ...providerDraft, defaultModel: event.target.value })} />
+            </label>
+            <label className="checkbox-row">
+              <input type="checkbox" checked={providerDraft.enabled} onChange={(event) => onProviderDraftChange({ ...providerDraft, enabled: event.target.checked })} />
+              <span>{t("enabled")}</span>
+            </label>
           </div>
-        </div>
+        </SettingsModal>
 
         <h3>{t("providers")}</h3>
         <div className="provider-list">
@@ -1354,9 +2203,9 @@ function SettingsPanel({
               </div>
               <span className={`status-badge ${provider.enabled ? "active" : "rejected"}`}>{provider.enabled ? t("enabled") : t("disabled")}</span>
               <div className="row-actions">
-                <button onClick={() => onEditProvider(provider)} title={t("edit")}><Pencil size={15} /></button>
-                <button onClick={() => void onTestProvider(provider)} title={t("testConnection")}><Check size={15} /></button>
-                <button onClick={() => void onDisableProvider(provider)} title={t("disable")}><X size={15} /></button>
+                <button type="button" onClick={() => openEditProvider(provider)} title={t("edit")}><Pencil size={15} /></button>
+                <button type="button" onClick={() => void onTestProvider(provider)} title={t("testConnection")}><Check size={15} /></button>
+                <button type="button" onClick={() => void onDisableProvider(provider)} title={t("disable")}><X size={15} /></button>
               </div>
             </div>
           ))}
@@ -1391,6 +2240,123 @@ function SettingsPanel({
         </div>
       </div>
 
+      <div className="settings-section llm-settings">
+        <SettingsSectionHeader title={t("webToolsConfiguration")} actionLabel={t("configure")} onAction={openWebToolsModal} />
+        <div className="settings-copy">{t("webToolsDescription")}</div>
+        <div className="settings-summary-row">
+          <span>
+            {webToolsSettings?.enabled ? t("enabled") : t("disabled")}
+            {" · "}
+            {webToolsSettings?.configured ? t("webToolsConfigured") : t("webToolsNotConfigured")}
+          </span>
+        </div>
+        {webToolsTestResult && <div className="settings-copy">{webToolsTestResult}</div>}
+
+        <SettingsModal
+          open={webToolsModalOpen}
+          title={t("webToolsConfiguration")}
+          onClose={closeWebToolsModal}
+          footer={(
+            <>
+              <button type="button" className="ghost-button" onClick={closeWebToolsModal}>{t("cancel")}</button>
+              <button type="button" className="ghost-button" onClick={() => void onTestWebTools()}>{t("testWebSearch")}</button>
+              <button type="button" className="primary-button" onClick={() => void saveWebToolsFromModal()}>{t("save")}</button>
+            </>
+          )}
+        >
+          <div className="provider-editor">
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={webToolsDraft.enabled}
+                onChange={(event) => onWebToolsDraftChange({ ...webToolsDraft, enabled: event.target.checked })}
+              />
+              <span>{t("webToolsEnabled")}</span>
+            </label>
+            <label>
+              <span>{t("webSearchProvider")}</span>
+              <select
+                value={webToolsDraft.searchProvider}
+                onChange={(event) => onWebToolsDraftChange({
+                  ...webToolsDraft,
+                  searchProvider: event.target.value as WebToolsDraft["searchProvider"]
+                })}
+              >
+                <option value="duckduckgo">{t("webSearchProviderDuckduckgo")}</option>
+                <option value="brave">{t("webSearchProviderBrave")}</option>
+                <option value="bailian">{t("webSearchProviderBailian")}</option>
+                <option value="searxng">{t("webSearchProviderSearxng")}</option>
+              </select>
+            </label>
+            {webToolsDraft.searchProvider === "brave" && (
+              <label>
+                <span>{t("braveSearchApiKey")}</span>
+                <input
+                  type="password"
+                  placeholder={webToolsSettings?.has_brave_api_key ? t("hasApiKey") : t("apiKey")}
+                  value={webToolsDraft.braveApiKey}
+                  onChange={(event) => onWebToolsDraftChange({ ...webToolsDraft, braveApiKey: event.target.value })}
+                />
+              </label>
+            )}
+            {webToolsDraft.searchProvider === "bailian" && (
+              <label>
+                <span>{t("dashscopeApiKey")}</span>
+                <input
+                  type="password"
+                  placeholder={webToolsSettings?.has_dashscope_api_key ? t("hasApiKey") : t("dashscopeApiKeyPlaceholder")}
+                  value={webToolsDraft.dashscopeApiKey}
+                  onChange={(event) => onWebToolsDraftChange({ ...webToolsDraft, dashscopeApiKey: event.target.value })}
+                />
+              </label>
+            )}
+            {webToolsDraft.searchProvider === "searxng" && (
+              <label>
+                <span>{t("searxngBaseUrl")}</span>
+                <input
+                  value={webToolsDraft.searxngUrl}
+                  placeholder="http://localhost:8888"
+                  onChange={(event) => onWebToolsDraftChange({ ...webToolsDraft, searxngUrl: event.target.value })}
+                />
+              </label>
+            )}
+            <label>
+              <span>{t("searchMaxResults")}</span>
+              <input
+                type="number"
+                min="1"
+                max="10"
+                value={webToolsDraft.searchMaxResults}
+                onChange={(event) => onWebToolsDraftChange({ ...webToolsDraft, searchMaxResults: Number(event.target.value) })}
+              />
+            </label>
+            <label>
+              <span>{t("fetchMaxChars")}</span>
+              <input
+                type="number"
+                min="1000"
+                max="50000"
+                value={webToolsDraft.fetchMaxChars}
+                onChange={(event) => onWebToolsDraftChange({ ...webToolsDraft, fetchMaxChars: Number(event.target.value) })}
+              />
+            </label>
+            <label>
+              <span>{t("fetchTimeoutMs")}</span>
+              <input
+                type="number"
+                min="1000"
+                max="60000"
+                value={webToolsDraft.fetchTimeoutMs}
+                onChange={(event) => onWebToolsDraftChange({ ...webToolsDraft, fetchTimeoutMs: Number(event.target.value) })}
+              />
+            </label>
+            <div className="settings-copy">
+              {webToolsSettings?.configured ? t("webToolsConfigured") : t("webToolsNotConfigured")}
+            </div>
+          </div>
+        </SettingsModal>
+      </div>
+
       <McpSettingsSection
         servers={mcpServers}
         draft={mcpDraft}
@@ -1412,11 +2378,9 @@ function SettingsPanel({
 
       <SkillsSection
         skills={skills}
-        draft={skillDraft}
-        onDraftChange={onSkillDraftChange}
-        onSave={onSaveSkill}
+        onUpload={onUploadSkills}
         onToggle={onToggleSkill}
-        onTest={onTestSkill}
+        onDelete={onDeleteSkill}
         t={t}
       />
     </section>
@@ -1444,55 +2408,89 @@ function McpSettingsSection({
   onRefresh: (server: McpServerResponse) => void;
   t: (key: TranslationKey) => string;
 }) {
+  const [modalOpen, setModalOpen] = useState(false);
+
+  function openAddModal() {
+    onDraftChange(emptyMcpDraft());
+    setModalOpen(true);
+  }
+
+  function openEditModal(server: McpServerResponse) {
+    onEdit(server);
+    setModalOpen(true);
+  }
+
+  function closeModal() {
+    setModalOpen(false);
+    onDraftChange(emptyMcpDraft());
+  }
+
+  async function saveFromModal() {
+    await onSave();
+    setModalOpen(false);
+  }
+
   return (
     <div className="settings-section llm-settings">
-      <h2>{t("mcpServers")}</h2>
+      <SettingsSectionHeader title={t("mcpServers")} actionLabel={t("addMcpServer")} onAction={openAddModal} />
       <div className="settings-copy">{t("mcpSafetyNote")}</div>
-      <div className="provider-editor">
-        <label>
-          <span>{t("displayName")}</span>
-          <input value={draft.name} onChange={(event) => onDraftChange({ ...draft, name: event.target.value })} />
-        </label>
-        <label>
-          <span>{t("transport")}</span>
-          <select value={draft.transport} onChange={(event) => onDraftChange({ ...draft, transport: event.target.value as McpServerDraft["transport"] })}>
-            <option value="stdio">stdio</option>
-            <option value="streamable_http">streamable_http</option>
-          </select>
-        </label>
-        <label>
-          <span>{t("command")}</span>
-          <input value={draft.command} onChange={(event) => onDraftChange({ ...draft, command: event.target.value })} />
-        </label>
-        <label>
-          <span>{t("arguments")}</span>
-          <input value={draft.args} onChange={(event) => onDraftChange({ ...draft, args: event.target.value })} />
-        </label>
-        <label>
-          <span>{t("url")}</span>
-          <input value={draft.url} onChange={(event) => onDraftChange({ ...draft, url: event.target.value })} />
-        </label>
-        <label>
-          <span>{t("headersJson")}</span>
-          <input value={draft.headers} placeholder='{"Authorization":"Bearer ..."}' onChange={(event) => onDraftChange({ ...draft, headers: event.target.value })} />
-        </label>
-        <label>
-          <span>{t("trustLevel")}</span>
-          <select value={draft.trustLevel} onChange={(event) => onDraftChange({ ...draft, trustLevel: event.target.value as McpServerDraft["trustLevel"] })}>
-            <option value="untrusted">{t("untrusted")}</option>
-            <option value="trusted">{t("trusted")}</option>
-            <option value="first_party">{t("firstParty")}</option>
-          </select>
-        </label>
-        <label className="checkbox-row">
-          <input type="checkbox" checked={draft.enabled} onChange={(event) => onDraftChange({ ...draft, enabled: event.target.checked })} />
-          <span>{t("enabled")}</span>
-        </label>
-        <div className="settings-actions">
-          <button className="ghost-button" onClick={() => onDraftChange(emptyMcpDraft())}>{t("cancel")}</button>
-          <button className="primary-button" onClick={() => void onSave()}>{draft.id ? t("save") : t("addMcpServer")}</button>
+
+      <SettingsModal
+        open={modalOpen}
+        title={draft.id ? t("editMcpServer") : t("addMcpServer")}
+        onClose={closeModal}
+        footer={(
+          <>
+            <button type="button" className="ghost-button" onClick={closeModal}>{t("cancel")}</button>
+            <button type="button" className="primary-button" onClick={() => void saveFromModal()}>
+              {draft.id ? t("save") : t("addMcpServer")}
+            </button>
+          </>
+        )}
+      >
+        <div className="provider-editor">
+          <label>
+            <span>{t("displayName")}</span>
+            <input value={draft.name} onChange={(event) => onDraftChange({ ...draft, name: event.target.value })} />
+          </label>
+          <label>
+            <span>{t("transport")}</span>
+            <select value={draft.transport} onChange={(event) => onDraftChange({ ...draft, transport: event.target.value as McpServerDraft["transport"] })}>
+              <option value="stdio">stdio</option>
+              <option value="streamable_http">streamable_http</option>
+            </select>
+          </label>
+          <label>
+            <span>{t("command")}</span>
+            <input value={draft.command} onChange={(event) => onDraftChange({ ...draft, command: event.target.value })} />
+          </label>
+          <label>
+            <span>{t("arguments")}</span>
+            <input value={draft.args} onChange={(event) => onDraftChange({ ...draft, args: event.target.value })} />
+          </label>
+          <label>
+            <span>{t("url")}</span>
+            <input value={draft.url} onChange={(event) => onDraftChange({ ...draft, url: event.target.value })} />
+          </label>
+          <label>
+            <span>{t("headersJson")}</span>
+            <input value={draft.headers} placeholder='{"Authorization":"Bearer ..."}' onChange={(event) => onDraftChange({ ...draft, headers: event.target.value })} />
+          </label>
+          <label>
+            <span>{t("trustLevel")}</span>
+            <select value={draft.trustLevel} onChange={(event) => onDraftChange({ ...draft, trustLevel: event.target.value as McpServerDraft["trustLevel"] })}>
+              <option value="untrusted">{t("untrusted")}</option>
+              <option value="trusted">{t("trusted")}</option>
+              <option value="first_party">{t("firstParty")}</option>
+            </select>
+          </label>
+          <label className="checkbox-row">
+            <input type="checkbox" checked={draft.enabled} onChange={(event) => onDraftChange({ ...draft, enabled: event.target.checked })} />
+            <span>{t("enabled")}</span>
+          </label>
         </div>
-      </div>
+      </SettingsModal>
+
       <div className="provider-list">
         {servers.length === 0 && <div className="empty-state">{t("noMcpServers")}</div>}
         {servers.map((server) => (
@@ -1503,10 +2501,10 @@ function McpSettingsSection({
             </div>
             <span className={`status-badge ${server.enabled ? "active" : "rejected"}`}>{server.enabled ? t("enabled") : t("disabled")}</span>
             <div className="row-actions">
-              <button onClick={() => onEdit(server)} title={t("edit")}><Pencil size={15} /></button>
-              <button onClick={() => void onTest(server)} title={t("testConnection")}><Check size={15} /></button>
-              <button onClick={() => void onRefresh(server)} title={t("refreshTools")}><Activity size={15} /></button>
-              <button onClick={() => void onDisable(server)} title={t("disable")}><X size={15} /></button>
+              <button type="button" onClick={() => openEditModal(server)} title={t("edit")}><Pencil size={15} /></button>
+              <button type="button" onClick={() => void onTest(server)} title={t("testConnection")}><Check size={15} /></button>
+              <button type="button" onClick={() => void onRefresh(server)} title={t("refreshTools")}><Activity size={15} /></button>
+              <button type="button" onClick={() => void onDisable(server)} title={t("disable")}><X size={15} /></button>
             </div>
           </div>
         ))}
@@ -1548,49 +2546,71 @@ function ToolRegistrySection({ tools, onPatchTool, onTestTool, t }: {
   );
 }
 
-function SkillsSection({ skills, draft, onDraftChange, onSave, onToggle, onTest, t }: {
+function SkillsSection({ skills, onUpload, onToggle, onDelete, t }: {
   skills: SkillResponse[];
-  draft: SkillDraft;
-  onDraftChange: (draft: SkillDraft) => void;
-  onSave: () => void;
+  onUpload: (file: File) => void;
   onToggle: (skill: SkillResponse) => void;
-  onTest: (skill: SkillResponse) => void;
+  onDelete: (skill: SkillResponse) => void;
   t: (key: TranslationKey) => string;
 }) {
+  const [dragOver, setDragOver] = useState(false);
+  const [modalOpen, setModalOpen] = useState(false);
+
+  function handleFile(file: File | undefined) {
+    if (file) {
+      onUpload(file);
+      setModalOpen(false);
+    }
+  }
+
   return (
     <div className="settings-section">
-      <h2>{t("skills")}</h2>
-      <div className="provider-editor skill-editor">
-        <label>
-          <span>{t("name")}</span>
-          <input value={draft.name} onChange={(event) => onDraftChange({ ...draft, name: event.target.value })} />
+      <SettingsSectionHeader title={t("skills")} actionLabel={t("uploadSkillsZip")} onAction={() => setModalOpen(true)} />
+
+      <SettingsModal
+        open={modalOpen}
+        title={t("uploadSkillsZip")}
+        onClose={() => setModalOpen(false)}
+      >
+        <p className="settings-copy">{t("uploadSkillsHint")}</p>
+        <label
+          className={`skill-upload-dropzone${dragOver ? " drag-over" : ""}`}
+          onDragEnter={(event) => {
+            event.preventDefault();
+            setDragOver(true);
+          }}
+          onDragOver={(event) => {
+            event.preventDefault();
+            setDragOver(true);
+          }}
+          onDragLeave={(event) => {
+            event.preventDefault();
+            if (event.relatedTarget instanceof globalThis.Node && event.currentTarget.contains(event.relatedTarget)) {
+              return;
+            }
+            setDragOver(false);
+          }}
+          onDrop={(event) => {
+            event.preventDefault();
+            setDragOver(false);
+            handleFile(event.dataTransfer.files[0]);
+          }}
+        >
+          <span>{t("uploadSkillsZip")}</span>
+          <small>{t("uploadSkillsDropHint")}</small>
+          <input
+            type="file"
+            accept=".zip,application/zip,application/x-zip-compressed"
+            onChange={(event) => {
+              handleFile(event.target.files?.[0]);
+              event.target.value = "";
+            }}
+          />
         </label>
-        <label>
-          <span>{t("description")}</span>
-          <input value={draft.description} onChange={(event) => onDraftChange({ ...draft, description: event.target.value })} />
-        </label>
-        <label>
-          <span>{t("requiredTools")}</span>
-          <input value={draft.requiredTools} onChange={(event) => onDraftChange({ ...draft, requiredTools: event.target.value })} />
-        </label>
-        <label>
-          <span>{t("risk")}</span>
-          <select value={draft.riskLevel} onChange={(event) => onDraftChange({ ...draft, riskLevel: event.target.value as "low" | "medium" | "high" })}>
-            <option value="low">{t("low")}</option>
-            <option value="medium">{t("medium")}</option>
-            <option value="high">{t("high")}</option>
-          </select>
-        </label>
-        <label className="skill-markdown">
-          <span>{t("instructions")}</span>
-          <textarea value={draft.instructionMarkdown} onChange={(event) => onDraftChange({ ...draft, instructionMarkdown: event.target.value })} />
-        </label>
-        <div className="settings-actions">
-          <button className="ghost-button" onClick={() => onDraftChange(emptySkillDraft())}>{t("cancel")}</button>
-          <button className="primary-button" onClick={() => void onSave()}>{t("addSkill")}</button>
-        </div>
-      </div>
+      </SettingsModal>
+
       <div className="skill-list">
+        {skills.length === 0 && <div className="empty-sidebar-state">{t("noSkills")}</div>}
         {skills.map((skill) => (
           <details className="skill-row" key={skill.id}>
             <summary>
@@ -1605,7 +2625,7 @@ function SkillsSection({ skills, draft, onDraftChange, onSave, onToggle, onTest,
             <pre>{skill.instruction_markdown}</pre>
             <div className="inline-actions">
               <button onClick={() => void onToggle(skill)}>{skill.enabled ? t("disable") : t("enable")}</button>
-              <button onClick={() => void onTest(skill)}>{t("testRun")}</button>
+              <button className="ghost-button" onClick={() => void onDelete(skill)}>{t("deleteSkill")}</button>
             </div>
           </details>
         ))}
@@ -1621,38 +2641,165 @@ function readCachedLocale(): UiLocale {
   return localStorage.getItem("sedna.ui_locale") === "zh-CN" ? "zh-CN" : "en";
 }
 
+function readRoute(): AppRoute {
+  const segments = window.location.pathname.split("/").filter(Boolean);
+  const tab = isMainTab(segments[0]) ? segments[0] : "chat";
+  return {
+    tab,
+    conversationId: tab === "chat" ? segments[1] : undefined
+  };
+}
+
+function isMainTab(value: string | undefined): value is MainTab {
+  return value === "chat" || value === "memory" || value === "tasks" || value === "graph" ||
+    value === "workers" || value === "activity" || value === "audit" || value === "settings";
+}
+
+function pathForRoute(route: AppRoute): string {
+  if (route.tab === "chat") {
+    return route.conversationId ? `/chat/${route.conversationId}` : "/chat";
+  }
+  return `/${route.tab}`;
+}
+
+function writeRoute(route: AppRoute, mode: "push" | "replace" = "push"): void {
+  const path = pathForRoute(route);
+  if (window.location.pathname === path) {
+    return;
+  }
+  if (mode === "replace") {
+    window.history.replaceState(null, "", path);
+  } else {
+    window.history.pushState(null, "", path);
+  }
+}
+
+interface MentionOption {
+  kind: "skill" | "tool";
+  name: string;
+  label: string;
+  description: string;
+}
+
+function getActiveMention(value: string, cursor: number): { start: number; query: string } | null {
+  const before = value.slice(0, cursor);
+  const match = before.match(/(?:^|\s)@([a-zA-Z0-9._:-]*)$/);
+  if (!match) {
+    return null;
+  }
+  const query = match[1];
+  return { start: before.length - query.length - 1, query };
+}
+
+function buildMentionOptions(
+  query: string,
+  skills: SkillResponse[],
+  tools: ToolRegistryResponse[]
+): MentionOption[] {
+  const normalized = query.toLowerCase();
+  const showSkills = !normalized.startsWith("tool:");
+  const showTools = !normalized.startsWith("skill:");
+  const skillQuery = normalized.startsWith("skill:") ? normalized.slice("skill:".length) : normalized;
+  const toolQuery = normalized.startsWith("tool:") ? normalized.slice("tool:".length) : normalized;
+  const options: MentionOption[] = [];
+
+  if (showSkills) {
+    for (const skill of skills) {
+      if (!skill.enabled) {
+        continue;
+      }
+      const token = `skill:${skill.name}`.toLowerCase();
+      if (
+        normalized
+        && !token.includes(normalized)
+        && !skill.name.toLowerCase().includes(skillQuery)
+        && !skill.description.toLowerCase().includes(skillQuery)
+      ) {
+        continue;
+      }
+      options.push({
+        kind: "skill",
+        name: skill.name,
+        label: skill.name,
+        description: skill.description
+      });
+    }
+  }
+
+  if (showTools) {
+    for (const tool of tools) {
+      if (!tool.enabled) {
+        continue;
+      }
+      const token = `tool:${tool.name}`.toLowerCase();
+      if (
+        normalized
+        && !token.includes(normalized)
+        && !tool.name.toLowerCase().includes(toolQuery)
+        && !tool.title.toLowerCase().includes(toolQuery)
+        && !tool.description.toLowerCase().includes(toolQuery)
+      ) {
+        continue;
+      }
+      options.push({
+        kind: "tool",
+        name: tool.name,
+        label: tool.title,
+        description: tool.description
+      });
+    }
+  }
+
+  return options.slice(0, 12);
+}
+
+function emptyWebToolsDraft(): WebToolsDraft {
+  return {
+    enabled: true,
+    searchProvider: "duckduckgo",
+    searchMaxResults: 5,
+    fetchMaxChars: 8000,
+    fetchTimeoutMs: 15000,
+    searxngUrl: "",
+    braveApiKey: "",
+    dashscopeApiKey: ""
+  };
+}
+
+function toWebToolsDraft(settings: WebToolsSettingsResponse): WebToolsDraft {
+  return {
+    enabled: settings.enabled,
+    searchProvider: settings.search_provider,
+    searchMaxResults: settings.search_max_results,
+    fetchMaxChars: settings.fetch_max_chars,
+    fetchTimeoutMs: settings.fetch_timeout_ms,
+    searxngUrl: settings.searxng_url ?? "",
+    braveApiKey: "",
+    dashscopeApiKey: ""
+  };
+}
+
 function emptyProviderDraft(): ProviderDraft {
   return {
-    displayName: "Mock",
-    adapterType: "mock",
+    displayName: "OpenAI",
+    adapterType: "openai-native",
     baseUrl: "",
     apiKey: "",
-    defaultModel: "mock-deterministic",
+    defaultModel: "gpt-4.1-mini",
     enabled: true
   };
 }
 
 function emptyMcpDraft(): McpServerDraft {
   return {
-    name: "Mock stdio MCP",
-    transport: "stdio",
-    command: "mock-stdio",
+    name: "",
+    transport: "streamable_http",
+    command: "",
     args: "",
     url: "",
     headers: "",
     enabled: true,
     trustLevel: "untrusted"
-  };
-}
-
-function emptySkillDraft(): SkillDraft {
-  return {
-    name: "local-planning",
-    description: "Local planning workflow for owner-approved tasks.",
-    instructionMarkdown: "# Instructions\nPlan safe internal next actions.\n\n# Verification\nReturn an audit-safe summary.",
-    requiredTools: "task.create,suggest_action",
-    riskLevel: "low",
-    enabled: true
   };
 }
 
@@ -1679,6 +2826,46 @@ function routePurposeLabel(purpose: LlmRoutePurpose, t: (key: TranslationKey) =>
     case "classification":
       return t("classification");
   }
+}
+
+function shouldShowAssistantStatus(phase: string): boolean {
+  return phase !== "reply_ready" && phase !== "memory_extraction" && phase !== "done";
+}
+
+function buildToolActivityTitle(
+  t: (key: TranslationKey) => string,
+  tool: string,
+  phase: string,
+  options: { query?: string; url?: string; fallbackTitle?: string }
+): string {
+  if (tool === "owner_profile_read") {
+    return t("readingOwnerProfile");
+  }
+  if (tool === "memory_search") {
+    return options.query ? `${t("searchingMemories")}: ${options.query}` : t("searchingMemories");
+  }
+  if (tool.startsWith("file.") || tool === "worker.status") {
+    return `${options.fallbackTitle ?? tool}${options.query ? `: ${options.query}` : ""}${options.url ? `: ${options.url}` : ""}`;
+  }
+  if (phase === "search" || tool === "web_search") {
+    return options.query ? `${t("webSearchActivity")}: ${options.query}` : t("webSearchActivity");
+  }
+  if (phase === "fetch" || tool === "web_fetch") {
+    return options.url ? `${t("webFetchActivity")}: ${options.url}` : t("webFetchActivity");
+  }
+  return options.fallbackTitle ?? tool;
+}
+
+function selectVisibleChatActivities(activities: ChatActivity[]): ChatActivity[] {
+  const deduped: ChatActivity[] = [];
+  for (const activity of activities) {
+    const previous = deduped[deduped.length - 1];
+    if (previous?.title === activity.title) {
+      continue;
+    }
+    deduped.push(activity);
+  }
+  return deduped.slice(-3);
 }
 
 function createAgentRun(content: string, now: string, t: (key: TranslationKey) => string): AgentRun {
@@ -1810,6 +2997,10 @@ function statusLabel(status: string, t: (key: TranslationKey) => string): string
     return t(key);
   }
   return status;
+}
+
+function memoryKindLabel(kind: string, _t: (key: TranslationKey) => string): string {
+  return kind;
 }
 
 function sourceLabel(candidate: MemoryCandidate): string {

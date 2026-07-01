@@ -24,17 +24,47 @@ export const ExtractedMemoryCandidateSchema = z.object({
   evidence_quote: z.string().min(1)
 });
 
+export const ProfilePatchProposalSchema = z.object({
+  target: z.literal("owner_profile"),
+  operation: z.enum(["add", "update", "replace", "ignore", "conflict", "ask_confirmation"]),
+  attribute_key: z.string().min(1),
+  semantic_type: z.enum([
+    "identity",
+    "preference",
+    "habit",
+    "interest",
+    "skill",
+    "work_context",
+    "communication_style",
+    "lifestyle",
+    "relationship",
+    "location",
+    "health",
+    "finance",
+    "sensitive",
+    "other"
+  ]),
+  value: z.record(z.unknown()),
+  normalized_value: z.string().min(1),
+  confidence: z.number().min(0).max(1),
+  risk: z.enum(["low", "medium", "high"]),
+  evidence_quote: z.string().min(1),
+  reason: z.string().min(1)
+});
+
 export const ExtractionResultSchema = z.object({
-  candidates: z.array(ExtractedMemoryCandidateSchema)
+  candidates: z.array(ExtractedMemoryCandidateSchema).default([]),
+  profile_patches: z.array(ProfilePatchProposalSchema).default([])
 });
 
 export type ExtractedMemoryCandidate = z.infer<typeof ExtractedMemoryCandidateSchema>;
+export type ExtractedProfilePatchProposal = z.infer<typeof ProfilePatchProposalSchema>;
 export type ExtractionResult = z.infer<typeof ExtractionResultSchema>;
 
 export const extractionJsonSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["candidates"],
+  required: ["candidates", "profile_patches"],
   properties: {
     candidates: {
       type: "array",
@@ -81,6 +111,55 @@ export const extractionJsonSchema = {
           confidence: { type: "number", minimum: 0, maximum: 1 },
           risk: { type: "string", enum: ["low", "medium", "high"] },
           evidence_quote: { type: "string" }
+        }
+      }
+    },
+    profile_patches: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "target",
+          "operation",
+          "attribute_key",
+          "semantic_type",
+          "value",
+          "normalized_value",
+          "confidence",
+          "risk",
+          "evidence_quote",
+          "reason"
+        ],
+        properties: {
+          target: { type: "string", enum: ["owner_profile"] },
+          operation: { type: "string", enum: ["add", "update", "replace", "ignore", "conflict", "ask_confirmation"] },
+          attribute_key: { type: "string" },
+          semantic_type: {
+            type: "string",
+            enum: [
+              "identity",
+              "preference",
+              "habit",
+              "interest",
+              "skill",
+              "work_context",
+              "communication_style",
+              "lifestyle",
+              "relationship",
+              "location",
+              "health",
+              "finance",
+              "sensitive",
+              "other"
+            ]
+          },
+          value: { type: "object" },
+          normalized_value: { type: "string" },
+          confidence: { type: "number", minimum: 0, maximum: 1 },
+          risk: { type: "string", enum: ["low", "medium", "high"] },
+          evidence_quote: { type: "string" },
+          reason: { type: "string" }
         }
       }
     }

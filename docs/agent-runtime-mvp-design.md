@@ -210,8 +210,8 @@ The Agent Runtime MVP is done when:
 
 1. an owner message creates an `agent_run`
 2. the run executes at least one plan/action/observation/final loop
-3. mock provider can deterministically create a task from a planning request
-4. mock provider can create a memory candidate from a preference statement
+3. internal fake provider tests can deterministically create a task from a planning request
+4. internal fake provider tests can create a memory candidate from a preference statement
 5. actions are executed only through the action executor
 6. every run and step is visible through events
 7. important actions write audit records

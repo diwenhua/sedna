@@ -30,7 +30,7 @@ The MVP includes:
 - candidate memory extraction from user messages
 - Memory Inbox for review
 - simple domain graph views
-- worker registry and capability model as data structures only
+- Worker MVP registry, heartbeat, read-only path scopes, and read-only jobs
 - dynamic LLM provider and model route configuration
 - MCP and Skills registry foundations
 
@@ -75,7 +75,7 @@ Recommended first implementation order:
 3. `packages/policy`
 4. `apps/brain`
 5. `apps/web`
-6. `apps/worker` minimal registry/mock only
+6. `apps/worker` read-only Worker MVP runtime
 7. `apps/cli` after pairing and local operations are better defined
 
 The current implementation should treat the following design documents as MVP slices:
@@ -119,9 +119,15 @@ Initial tables:
 - `edges`
 - `evidence`
 - `memory_candidates`
+- `profiles`
+- `profile_attributes`
+- `profile_attribute_history`
 - `audit_log`
 - `workers`
 - `worker_capabilities`
+- `worker_path_scopes`
+- `worker_jobs`
+- `worker_events`
 - `settings`
 
 Core graph fields:
@@ -164,6 +170,8 @@ evidence:
 ```
 
 `payload_json` is acceptable in the first version because the graph will evolve. Stable fields stay relational; changing domain-specific fields live in JSON until patterns settle.
+
+Owner Profile attributes are graph nodes linked by `has_attribute` edges from the `owner_profile` node. `profiles` keeps lightweight owner metadata; `profile_attribute_history` keeps change history keyed by graph node id. LLM extraction proposes profile patches; the Brain profile service decides merge, replace, conflict, review, confirmation, evidence, history, events, and audit.
 
 ## Memory Candidate Lifecycle
 
@@ -208,6 +216,15 @@ Core MVP event types:
 - `edge.created`
 - `task.suggested`
 - `worker.registered`
+- `worker.heartbeat`
+- `worker.online`
+- `worker.offline`
+- `worker.capability.updated`
+- `worker.path_scope.updated`
+- `worker.job.created`
+- `worker.job.started`
+- `worker.job.completed`
+- `worker.job.failed`
 - `audit.recorded`
 
 The Web UI should render user-facing events as timeline items. Raw audit records remain inspectable but are not the normal reading experience.
@@ -235,7 +252,21 @@ GET    /api/graph/nodes/:id
 GET    /api/graph/views/:view
 
 GET    /api/workers
-POST   /api/workers/register-mock
+POST   /api/workers/pair-codes
+GET    /api/workers/pair-codes
+POST   /api/workers/pair
+GET    /api/workers/:id
+PATCH  /api/workers/:id
+DELETE /api/workers/:id
+POST   /api/workers/:id/revoke
+POST   /api/workers/:id/heartbeat
+POST   /api/workers/:id/capabilities
+POST   /api/workers/:id/path-scopes
+GET    /api/workers/:id/jobs/pending
+POST   /api/workers/:id/jobs/:jobId/start
+POST   /api/workers/:id/jobs/:jobId/complete
+POST   /api/workers/:id/jobs/:jobId/fail
+POST   /api/worker-jobs
 GET    /api/audit
 
 GET    /api/settings
@@ -296,9 +327,9 @@ The Web UI must support English and Simplified Chinese in the MVP. Language swit
 
 ## Worker MVP Position
 
-Workers are part of the architecture from the beginning, but full execution is not the first proof point.
+Workers are part of the architecture from the beginning, but broad automation is not the first proof point.
 
-The MVP should model workers as graph and policy entities:
+The Worker MVP should model workers as graph and policy entities while allowing only narrow read-only execution:
 
 - worker identity
 - display name
@@ -309,14 +340,35 @@ The MVP should model workers as graph and policy entities:
 - allowed scopes
 - risk policy
 
-The first implementation can include:
+The first implementation includes:
 
 - worker table
 - worker capability table
-- mock worker registration endpoint
+- worker path scopes
+- worker jobs
+- worker events
+- worker registration endpoint
+- heartbeat endpoint
+- pending job polling
+- job start/complete/fail result reporting
 - worker nodes in graph view
+- Workers page in the Web UI
 
-Real pairing and read-only file search can be the next slice after Brain memory is useful.
+The supported Worker MVP capabilities are:
+
+- `worker.status`
+- `file.list` within approved read-only paths
+- `file.search` within approved read-only paths
+- `file.read` within approved read-only paths and file-size limits
+
+The Worker MVP intentionally does not support command execution, file writing, browser control, email sending, app control, external publishing, payment/account actions, or automatic high-risk execution.
+
+Formal pairing, device credentials, background service installation, write actions, and multi-worker orchestration remain future slices.
+
+Usage instructions are documented in:
+
+- [Worker MVP Usage](worker-mvp-usage.md)
+- [Worker MVP Usage zh-CN](worker-mvp-usage.zh-CN.md)
 
 ## LLM Integration
 
@@ -331,15 +383,15 @@ The detailed Agent Runtime plan is defined in:
 
 - [docs/agent-runtime-mvp-design.md](agent-runtime-mvp-design.md)
 
-The Brain should support both:
+The Brain should require a configured real provider:
 
-- `mock`: deterministic provider for tests and local demos without secrets
 - `openai`: real provider for actual conversation
+- additional adapters through dynamic provider configuration
 
 Configuration:
 
 ```text
-LLM_PROVIDER=mock | openai
+LLM_PROVIDER=openai
 OPENAI_API_KEY=...
 OPENAI_MODEL=...
 ```

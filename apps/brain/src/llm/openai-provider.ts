@@ -1,5 +1,6 @@
 import { buildChatMessages } from "./prompts/chat.js";
 import { buildExtractMemoryPrompt } from "./prompts/extract-memory.js";
+import { parseModelJson } from "./json.js";
 import { extractionJsonSchema } from "./schemas.js";
 import type { LlmConversationInput, LlmExtractionInput, LlmProvider, LlmTextResult } from "./provider.js";
 
@@ -15,7 +16,7 @@ export class OpenAiLlmProvider implements LlmProvider {
 
   constructor(private readonly options: OpenAiProviderOptions) {
     if (!options.apiKey) {
-      throw new Error("OpenAI provider requires OPENAI_API_KEY. Set OPENAI_API_KEY or use LLM_PROVIDER=mock.");
+      throw new Error("OpenAI provider requires OPENAI_API_KEY.");
     }
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
@@ -54,7 +55,7 @@ export class OpenAiLlmProvider implements LlmProvider {
         }
       }
     });
-    return JSON.parse(extractResponseText(response)) as unknown;
+    return parseModelJson(extractResponseText(response));
   }
 
   private async callResponsesApi(body: Record<string, unknown>): Promise<unknown> {

@@ -1,6 +1,7 @@
 import type { MemoryStore } from "@sedna/memory";
 import type { ToolRegistryEntry } from "@sedna/protocol";
 import { McpClient } from "../mcp/client.js";
+import { executeInternalTool } from "./internal-tools.js";
 
 export interface ToolExecutionResult {
   status: "completed" | "confirmation_required" | "failed";
@@ -8,11 +9,16 @@ export interface ToolExecutionResult {
   observation: Record<string, unknown>;
 }
 
+export interface ToolExecutorOptions {
+  fetchImpl?: typeof fetch;
+}
+
 export async function executeTool(
   store: MemoryStore,
   toolId: string,
   input: Record<string, unknown> = {},
-  client = new McpClient()
+  client = new McpClient(),
+  options: ToolExecutorOptions = {}
 ): Promise<ToolExecutionResult> {
   const tool = store.getToolRegistryEntry(toolId);
   if (!tool) {
@@ -48,6 +54,8 @@ export async function executeTool(
       observation = (await client.callTool(server, mcpTool.name, input)).content;
     } else if (tool.source === "skill") {
       observation = { message: "Use /api/skills/:id/test to run skill workflows in the MVP" };
+    } else if (tool.source === "internal") {
+      observation = await executeInternalTool(store, tool.sourceId, input, options.fetchImpl ?? fetch);
     } else {
       observation = { message: "Internal tool executed", input };
     }

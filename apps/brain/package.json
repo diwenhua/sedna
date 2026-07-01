@@ -12,13 +12,16 @@
     "dev": "tsx src/index.ts"
   },
   "dependencies": {
+    "@fastify/multipart": "^10.0.0",
     "@sedna/memory": "workspace:*",
     "@sedna/protocol": "workspace:*",
     "@sedna/shared": "workspace:*",
+    "adm-zip": "^0.5.18",
     "fastify": "^5.6.2",
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
     "tsx": "^4.20.6",
     "typescript": "^5.8.3",
     "vitest": "^3.2.4"

@@ -32,13 +32,13 @@ describe("LLM environment configuration", () => {
     store.close();
   });
 
-  it("fails clearly when OpenAI env config is selected without a key", () => {
+  it("skips OpenAI env sync when the API key is missing", () => {
     const store = createMemoryStore(":memory:");
     store.migrate();
 
-    expect(() => syncLlmEnvConfig(store, { LLM_PROVIDER: "openai" })).toThrow(
-      "OpenAI provider requires OPENAI_API_KEY"
-    );
+    syncLlmEnvConfig(store, { LLM_PROVIDER: "openai" });
+
+    expect(store.listLlmProviderConfigs()).toEqual([]);
 
     store.close();
   });

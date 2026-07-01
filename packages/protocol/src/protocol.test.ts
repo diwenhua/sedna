@@ -8,7 +8,9 @@ import {
   LlmProviderConfigSchema,
   LlmProviderPresetSchema,
   MemoryCandidateSchema,
-  MessageSchema
+  MessageSchema,
+  WorkerJobSchema,
+  WorkerPathScopeSchema
 } from "./index.js";
 
 describe("protocol schemas", () => {
@@ -94,11 +96,38 @@ describe("protocol schemas", () => {
       allowedScopes: ["self"],
       inputSchema: {},
       outputSchema: {},
-      createdAt: "2026-06-29T00:00:02.000Z"
+      enabled: true,
+      createdAt: "2026-06-29T00:00:02.000Z",
+      updatedAt: "2026-06-29T00:00:02.000Z"
     });
 
     expect(edge.sourceNodeId).toBe(node.id);
     expect(capability.readOnly).toBe(true);
+  });
+
+  it("accepts worker path scopes and read-only jobs", () => {
+    const scope = WorkerPathScopeSchema.parse({
+      id: "scope_1",
+      workerId: "worker_1",
+      label: "Projects",
+      path: "/Users/owner/Projects",
+      mode: "read_only",
+      enabled: true,
+      createdAt: "2026-06-29T00:00:00.000Z",
+      updatedAt: "2026-06-29T00:00:00.000Z"
+    });
+    const job = WorkerJobSchema.parse({
+      id: "job_1",
+      workerId: scope.workerId,
+      capability: "file.search",
+      input: { query: "README", paths: [scope.path], max_results: 10 },
+      status: "queued",
+      timeoutMs: 30000,
+      createdAt: "2026-06-29T00:00:01.000Z"
+    });
+
+    expect(job.capability).toBe("file.search");
+    expect(scope.mode).toBe("read_only");
   });
 
   it("accepts language settings", () => {

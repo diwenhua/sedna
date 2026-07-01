@@ -20,7 +20,6 @@ The Brain should call a unified LLM service. Vendor SDK calls should stay behind
 
 Adapter types:
 
-- `mock`
 - `openai-compatible`
 - `openai-native`
 - `anthropic`
@@ -85,7 +84,7 @@ If a route is missing:
 - `agent_planning` falls back to `chat_reply`
 - `memory_extraction` falls back to `chat_reply`
 - `summarization` falls back to `chat_reply`
-- `classification` falls back to `mock` or `chat_reply`, depending on environment
+- `classification` falls back to `chat_reply`
 
 ## Data Model
 
@@ -150,6 +149,6 @@ The dynamic LLM MVP is done when:
 4. provider test connection works
 5. `chat_reply` and `memory_extraction` can use different routes
 6. `agent_planning` is supported or falls back predictably
-7. mock provider still works without secrets
+7. tests can use internal fake providers without exposing a product mock provider
 8. API keys are never returned to the frontend in plaintext
 9. provider and route changes produce events or audit records
