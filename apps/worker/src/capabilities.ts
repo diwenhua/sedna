@@ -1,5 +1,8 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { appendFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
+import { runWorkerAgentTask, type WorkerAgentLlmConfig } from "./agent-loop.js";
 
 export interface FileSearchInput {
   query: string;
@@ -17,37 +20,74 @@ export interface FileListInput {
   max_entries?: number;
 }
 
+export interface FileWriteInput {
+  path: string;
+  content: string;
+  mode?: "overwrite" | "append";
+  create_directories?: boolean;
+}
+
+export interface CommandRunInput {
+  command: string;
+  cwd?: string;
+  timeout_ms?: number;
+}
+
 export interface WorkerRuntimePolicy {
   allowedPaths: string[];
   maxReadBytes: number;
+  maxWriteBytes: number;
   maxSearchResults: number;
   maxListEntries: number;
+  maxCommandMs: number;
+  maxCommandOutputBytes: number;
 }
 
-const SKIPPED_DIRS = new Set([".git", "node_modules", "dist", "build"]);
+export interface WorkerCapabilityContext {
+  policy: WorkerRuntimePolicy;
+  fetchAgentLlm?: () => Promise<WorkerAgentLlmConfig>;
+  fetchImpl?: typeof fetch;
+}
 
 export async function executeWorkerCapability(
   capability: string,
   input: Record<string, unknown>,
-  policy: WorkerRuntimePolicy
+  context: WorkerRuntimePolicy | WorkerCapabilityContext
 ): Promise<Record<string, unknown>> {
+  const resolved = normalizeCapabilityContext(context);
+  const policy = resolved.policy;
   if (capability === "worker.status") {
     return {
       ok: true,
-      allowed_paths: policy.allowedPaths,
-      capabilities: ["worker.status", "file.search", "file.read", "file.list"]
+      optional_path_roots: policy.allowedPaths,
+      capabilities: ["worker.status", "agent.execute"]
     };
   }
-  if (capability === "file.list") {
-    return fileList(parseFileListInput(input), policy);
-  }
-  if (capability === "file.search") {
-    return fileSearch(parseFileSearchInput(input), policy);
-  }
-  if (capability === "file.read") {
-    return fileRead(parseFileReadInput(input), policy);
+  if (capability === "agent.execute") {
+    const goal = typeof input.goal === "string" ? input.goal.trim() : "";
+    if (goal.length === 0) {
+      throw new Error("agent.execute requires goal.");
+    }
+    if (!resolved.fetchAgentLlm) {
+      throw new Error("Worker agent LLM is not configured on Brain.");
+    }
+    const llm = await resolved.fetchAgentLlm();
+    return runWorkerAgentTask({
+      goal,
+      context: typeof input.context === "string" ? input.context : undefined,
+      policy,
+      llm,
+      fetchImpl: resolved.fetchImpl
+    });
   }
   throw new Error(`Unsupported worker capability: ${capability}`);
+}
+
+function normalizeCapabilityContext(context: WorkerRuntimePolicy | WorkerCapabilityContext): WorkerCapabilityContext {
+  if ("policy" in context) {
+    return context;
+  }
+  return { policy: context };
 }
 
 export async function fileList(input: FileListInput, policy: WorkerRuntimePolicy): Promise<Record<string, unknown>> {
@@ -63,9 +103,6 @@ export async function fileList(input: FileListInput, policy: WorkerRuntimePolicy
       break;
     }
     if (!entry.isFile() && !entry.isDirectory()) {
-      continue;
-    }
-    if (SKIPPED_DIRS.has(entry.name)) {
       continue;
     }
     const entryPath = path.join(input.path, entry.name);
@@ -95,7 +132,7 @@ export async function fileSearch(input: FileSearchInput, policy: WorkerRuntimePo
   }
   const maxResults = Math.min(input.max_results ?? policy.maxSearchResults, policy.maxSearchResults);
   const matches: Array<{ path: string; name: string; size: number; modified_at: string }> = [];
-  for (const searchPath of input.paths) {
+  for (const searchPath of resolveSearchPaths(input.paths, policy.allowedPaths)) {
     assertPathAllowed(searchPath, policy.allowedPaths);
     await walk(searchPath, async (entryPath, entryStat) => {
       if (matches.length >= maxResults) {
@@ -136,9 +173,101 @@ export async function fileRead(input: FileReadInput, policy: WorkerRuntimePolicy
   };
 }
 
+export async function fileWrite(input: FileWriteInput, policy: WorkerRuntimePolicy): Promise<Record<string, unknown>> {
+  const targetPath = path.resolve(input.path);
+  assertPathAllowed(targetPath, policy.allowedPaths);
+  const content = input.content;
+  const byteLength = Buffer.byteLength(content, "utf8");
+  if (byteLength > policy.maxWriteBytes) {
+    throw new Error("Write content exceeds worker max write size.");
+  }
+  if (input.create_directories) {
+    await mkdir(path.dirname(targetPath), { recursive: true });
+  }
+  if (input.mode === "append") {
+    await appendFile(targetPath, content, "utf8");
+  } else {
+    await writeFile(targetPath, content, "utf8");
+  }
+  return {
+    path: targetPath,
+    bytes_written: byteLength,
+    mode: input.mode ?? "overwrite"
+  };
+}
+
+export async function commandRun(input: CommandRunInput, policy: WorkerRuntimePolicy): Promise<Record<string, unknown>> {
+  const command = input.command.trim();
+  if (command.length === 0) {
+    throw new Error("command_run requires command.");
+  }
+  const cwd = path.resolve(input.cwd ?? process.cwd());
+  assertPathAllowed(cwd, policy.allowedPaths);
+  const timeoutMs = Math.min(input.timeout_ms ?? policy.maxCommandMs, policy.maxCommandMs);
+  const startedAt = Date.now();
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, {
+      cwd,
+      shell: true,
+      env: process.env
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
+
+    const appendOutput = (current: string, chunk: Buffer, stream: "stdout" | "stderr") => {
+      const next = current + chunk.toString("utf8");
+      if (Buffer.byteLength(next, "utf8") <= policy.maxCommandOutputBytes) {
+        return next;
+      }
+      const truncated = Buffer.from(next, "utf8").subarray(0, policy.maxCommandOutputBytes).toString("utf8");
+      if (stream === "stdout") {
+        stderr += "\n[stdout truncated by worker policy]\n";
+      } else {
+        stderr += "\n[stderr truncated by worker policy]\n";
+      }
+      return truncated;
+    };
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout = appendOutput(stdout, chunk, "stdout");
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr = appendOutput(stderr, chunk, "stderr");
+    });
+
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+
+    child.on("close", (exitCode, signal) => {
+      clearTimeout(timeout);
+      resolve({
+        command,
+        cwd,
+        exit_code: exitCode,
+        signal,
+        timed_out: timedOut,
+        duration_ms: Date.now() - startedAt,
+        stdout,
+        stderr
+      });
+    });
+  });
+}
+
 export function assertPathAllowed(targetPath: string, allowedPaths: string[]): void {
   if (isForbiddenPath(targetPath)) {
     throw new Error("Path is forbidden by worker policy.");
+  }
+  if (allowedPaths.length === 0) {
+    return;
   }
   const normalizedTarget = normalizePath(targetPath);
   if (!allowedPaths.some((allowedPath) => {
@@ -147,6 +276,16 @@ export function assertPathAllowed(targetPath: string, allowedPaths: string[]): v
   })) {
     throw new Error("Path is outside worker allowlist.");
   }
+}
+
+function resolveSearchPaths(inputPaths: string[], allowedPaths: string[]): string[] {
+  if (inputPaths.length > 0) {
+    return inputPaths;
+  }
+  if (allowedPaths.length > 0) {
+    return allowedPaths;
+  }
+  return [os.homedir()];
 }
 
 export function parseAllowedPaths(value: string | undefined): string[] {
@@ -190,9 +329,6 @@ async function walk(
       continue;
     }
     if (entry.isDirectory()) {
-      if (SKIPPED_DIRS.has(entry.name)) {
-        continue;
-      }
       const shouldContinue = await walk(entryPath, onFile);
       if (!shouldContinue) {
         return false;
@@ -212,7 +348,10 @@ async function walk(
 
 function isForbiddenPath(targetPath: string): boolean {
   const normalized = targetPath.toLowerCase().replace(/\\/g, "/");
-  return /(^|\/)(\.env|\.ssh|node_modules|dist|build|\.git)(\/|$)/.test(normalized)
+  const baseName = path.basename(normalized);
+  return /(^|\/)(\.env|\.ssh)(\/|$)/.test(normalized)
+    || baseName === ".env"
+    || baseName.startsWith(".env.")
     || /\.(sqlite|sqlite3|db|pem|key|p12|pfx)$/i.test(normalized)
     || normalized.includes("credential")
     || normalized.includes("secret");

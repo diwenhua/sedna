@@ -1369,6 +1369,31 @@ export class MemoryStore {
     return this.upsertWorkerCapability(workerId, input, { preservePolicy: true });
   }
 
+  syncWorkerCapabilities(workerId: string, inputs: WorkerCapabilityInput[]): Capability[] {
+    this.requireWorker(workerId);
+    const declaredNames = new Set(inputs.map((input) => input.name));
+    for (const capability of this.listWorkerCapabilities(workerId)) {
+      if (declaredNames.has(capability.name)) {
+        continue;
+      }
+      this.db.prepare("DELETE FROM worker_capabilities WHERE id = ?").run(capability.id);
+      this.createWorkerEvent(workerId, undefined, "worker.capability.updated", {
+        name: capability.name,
+        removed: true
+      });
+      this.createEvent("worker.capability.updated", "Worker capability removed", {
+        workerId,
+        name: capability.name,
+        removed: true
+      }, { relatedWorkerId: workerId });
+      this.createAuditRecord("worker", "worker.capability.removed", "worker", workerId, {
+        workerId,
+        name: capability.name
+      });
+    }
+    return inputs.map((input) => this.upsertWorkerCapability(workerId, input, { preservePolicy: true }));
+  }
+
   upsertWorkerCapability(
     workerId: string,
     input: WorkerCapabilityInput,
@@ -1492,6 +1517,32 @@ export class MemoryStore {
     };
   }
 
+  getWorkerAgentLlmConfig(): {
+    adapterType: LlmAdapterType;
+    baseUrl?: string;
+    apiKey: string;
+    model: string;
+    temperature: number;
+    maxTokens: number;
+  } | undefined {
+    const route = this.getLlmModelRoute("chat_reply");
+    if (!route || !route.enabled) {
+      return undefined;
+    }
+    const provider = this.getLlmProviderConfigWithSecret(route.providerConfigId);
+    if (!provider || !provider.enabled || !provider.apiKey) {
+      return undefined;
+    }
+    return {
+      adapterType: provider.adapterType,
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey,
+      model: route.model,
+      temperature: route.temperature,
+      maxTokens: route.maxTokens
+    };
+  }
+
   listWorkerPathScopes(workerId: string): WorkerPathScope[] {
     this.requireWorker(workerId);
     return this.db
@@ -1594,8 +1645,8 @@ export class MemoryStore {
     if (!capability || !capability.enabled) {
       throw new Error(`Worker capability is not enabled: ${input.capability}`);
     }
-    if (!capability.readOnly) {
-      throw new Error(`Worker capability is not read-only: ${input.capability}`);
+    if (!capability.readOnly && input.capability !== "agent.execute") {
+      throw new Error(`Worker capability is not enabled for jobs: ${input.capability}`);
     }
     this.validateWorkerJobInput(input.workerId, input.capability, input.input);
     const now = nowIso();
@@ -2986,28 +3037,10 @@ export class MemoryStore {
     if (capability === "worker.status") {
       return;
     }
-    if (capability === "file.search") {
-      const paths = Array.isArray(input.paths) ? input.paths.map(String) : [];
-      if (paths.length === 0) {
-        throw new Error("file.search requires at least one path.");
+    if (capability === "agent.execute") {
+      if (typeof input.goal !== "string" || input.goal.trim().length === 0) {
+        throw new Error("agent.execute requires goal.");
       }
-      for (const path of paths) {
-        this.assertWorkerPathAllowed(workerId, path);
-      }
-      return;
-    }
-    if (capability === "file.list") {
-      if (typeof input.path !== "string") {
-        throw new Error("file.list requires a path.");
-      }
-      this.assertWorkerPathAllowed(workerId, input.path);
-      return;
-    }
-    if (capability === "file.read") {
-      if (typeof input.path !== "string") {
-        throw new Error("file.read requires a path.");
-      }
-      this.assertWorkerPathAllowed(workerId, input.path);
       return;
     }
     throw new Error(`Unsupported worker capability: ${capability}`);

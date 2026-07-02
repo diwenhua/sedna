@@ -242,13 +242,14 @@ Worker connection model:
 - Web UI updates can use WebSocket or Server-Sent Events.
 - Artifacts should use HTTPS upload/download or another dedicated artifact channel, not large WebSocket payloads.
 
-The initial approved capabilities should be conservative. For example:
+The initial Brain-visible worker capabilities should be conservative:
 
 - worker.status
-- file.search within approved paths
-- file.read within approved paths
+- agent.execute
 
-Higher-risk capabilities such as command.run, file.write, browser control, email.send, or external publishing require explicit owner enablement and policy configuration.
+`agent.execute` may run a local Worker Agent that uses internal file tools and shell commands on the worker device. Those local tools are not standalone Brain capabilities; they must stay behind worker credentials, path/runtime policy, sensitive-path blocking, job timeouts, audit records, and owner-visible worker configuration.
+
+Higher-risk capabilities such as browser control, email.send, external publishing, payment/account actions, or production operations require explicit owner enablement and policy configuration.
 
 Worker registration and pairing should produce audit records.
 
@@ -786,7 +787,7 @@ Some internal actions should be allowed but reviewable:
 - changing task priority
 - marking a method as applicable to a task pattern
 
-External actions should be limited in the first version. User-initiated, read-only external actions may be allowed with clear disclosure. Examples:
+External actions should be limited in the first version. User-initiated external inspection and worker-local execution may be allowed with clear disclosure and policy controls. Examples:
 
 - reading a URL provided by the owner
 - processing an uploaded or selected document
@@ -794,6 +795,8 @@ External actions should be limited in the first version. User-initiated, read-on
 - performing a read-only inspection
 - reading an allowed local file through a registered worker
 - searching an allowed directory through a registered worker
+- editing a text file through a registered worker when the path is allowed and policy permits it
+- running a bounded shell command through a registered worker when policy permits it
 
 Write, send, delete, publish, commit, payment, account, production, or irreversible actions require explicit confirmation and may be deferred out of the first implementation.
 
@@ -824,7 +827,7 @@ The key first-version rule is:
 
 ```text
 understanding-first, with safe internal actions
-read-only external actions only when owner-initiated or clearly approved
+external inspection and worker-local execution only when owner-initiated or clearly approved
 external write/change/send/delete actions require confirmation
 distributed worker jobs must be scoped, authenticated, audited, and policy-checked
 ```
@@ -893,7 +896,7 @@ Rules:
 - Workers do not independently expand their permissions.
 - The owner can pause or disable any worker.
 
-The first implementation can start with one local worker, but the architecture should already support multiple workers and cross-worker tasks.
+The first implementation can start with one local Worker Agent, but the architecture should already support multiple workers and cross-worker tasks.
 
 ## Conversation, Events, And Notifications
 
@@ -1123,26 +1126,26 @@ Move toward a server-first structure:
 
 ```text
 sedna/
-  server/
-    agent/
+  apps/
+    brain/
+    worker/
+    web/
+    cli/
+  packages/
+    protocol/
     memory/
-    profile/
-    goals/
-    actions/
-    workers/
-    api/
-  worker/
-  web/
+    policy/
+    shared/
   docs/
   data/        ignored private local data
 ```
 
-The exact framework is not decided yet.
+The current implementation baseline is TypeScript with a pnpm workspace, Fastify for the Brain API, React + Vite for the Web UI, and SQLite-backed local runtime storage.
 
 ## Open Questions
 
-- Which backend framework should be used for the first server implementation?
-- Which Web UI stack should be used?
+- How should Brain policy and worker runtime policy converge so path scopes are enforced consistently on both sides?
+- What confirmation model should apply to mutating Worker Agent actions such as file writes and shell commands?
 - How much of the onboarding should be LLM-driven versus rule-driven?
 - What is the first minimum useful graph schema?
 - How should memory review and confirmation appear in the UI?

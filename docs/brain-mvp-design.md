@@ -30,7 +30,7 @@ The MVP includes:
 - candidate memory extraction from user messages
 - Memory Inbox for review
 - simple domain graph views
-- Worker MVP registry, heartbeat, read-only path scopes, and read-only jobs
+- Worker MVP registry, pair-code enrollment, policy-scoped Worker Agent jobs, and audit
 - dynamic LLM provider and model route configuration
 - MCP and Skills registry foundations
 
@@ -75,7 +75,7 @@ Recommended first implementation order:
 3. `packages/policy`
 4. `apps/brain`
 5. `apps/web`
-6. `apps/worker` read-only Worker MVP runtime
+6. `apps/worker` policy-scoped Worker Agent runtime
 7. `apps/cli` after pairing and local operations are better defined
 
 The current implementation should treat the following design documents as MVP slices:
@@ -91,20 +91,20 @@ The current implementation should treat the following design documents as MVP sl
 
 Use TypeScript for the first version.
 
-Recommended baseline:
+Current baseline:
 
 - package manager: `pnpm`
 - monorepo: pnpm workspaces
 - server runtime: Node.js
-- API framework: Fastify or Hono
+- API framework: Fastify
 - database: SQLite
-- migrations: Drizzle Kit or Kysely migrations
+- migrations: repository-managed SQLite schema/migrations
 - Web UI: React + Vite
 - graph visualization: React Flow or Cytoscape.js
 - localization: typed translation dictionaries or a lightweight i18n library
 - shared schemas: Zod
 
-The exact framework can still be finalized before implementation. The important choice is to keep protocol, memory, and policy types shared between Brain and Web from the start.
+The important boundary is to keep protocol, memory, and policy types shared between Brain, Web, and Worker from the start.
 
 ## Core Data Model
 
@@ -261,7 +261,13 @@ DELETE /api/workers/:id
 POST   /api/workers/:id/revoke
 POST   /api/workers/:id/heartbeat
 POST   /api/workers/:id/capabilities
+POST   /api/workers/:id/capabilities/sync
+PATCH  /api/workers/:id/capabilities/:capabilityId
 POST   /api/workers/:id/path-scopes
+PATCH  /api/workers/:id/path-scopes/:scopeId
+DELETE /api/workers/:id/path-scopes/:scopeId
+GET    /api/workers/:id/policy
+GET    /api/workers/:id/agent-llm
 GET    /api/workers/:id/jobs/pending
 POST   /api/workers/:id/jobs/:jobId/start
 POST   /api/workers/:id/jobs/:jobId/complete
@@ -327,9 +333,9 @@ The Web UI must support English and Simplified Chinese in the MVP. Language swit
 
 ## Worker MVP Position
 
-Workers are part of the architecture from the beginning, but broad automation is not the first proof point.
+Workers are part of the architecture from the beginning, but uncontrolled automation is not the first proof point.
 
-The Worker MVP should model workers as graph and policy entities while allowing only narrow read-only execution:
+The Worker MVP should model workers as graph and policy entities while allowing Brain to dispatch a bounded local Worker Agent:
 
 - worker identity
 - display name
@@ -347,8 +353,10 @@ The first implementation includes:
 - worker path scopes
 - worker jobs
 - worker events
-- worker registration endpoint
+- pair-code enrollment
+- credentialed worker authentication
 - heartbeat endpoint
+- worker policy sync
 - pending job polling
 - job start/complete/fail result reporting
 - worker nodes in graph view
@@ -357,13 +365,22 @@ The first implementation includes:
 The supported Worker MVP capabilities are:
 
 - `worker.status`
-- `file.list` within approved read-only paths
-- `file.search` within approved read-only paths
-- `file.read` within approved read-only paths and file-size limits
+- `agent.execute`
 
-The Worker MVP intentionally does not support command execution, file writing, browser control, email sending, app control, external publishing, payment/account actions, or automatic high-risk execution.
+`agent.execute` accepts a natural-language task from Brain and runs a local Worker Agent on the worker device. Inside that Worker Agent, local tools may list, search, read, write files, and run shell commands, but only within the runtime policy:
 
-Formal pairing, device credentials, background service installation, write actions, and multi-worker orchestration remain future slices.
+- path allowlist from `SEDNA_WORKER_ALLOWED_PATHS`; Brain stores and displays path scopes for owner policy management, while the current runtime policy is driven by worker environment variables
+- sensitive path blocking for secrets, credentials, runtime databases, `.git`, dependency folders, and build output
+- max read/write/output limits
+- job timeout
+- worker credential authentication
+- Brain-side job events and audit records
+
+`file.list`, `file.search`, `file.read`, `file.write`, and command execution are not standalone Brain-visible worker capabilities in the current MVP. They are internal Worker Agent tools behind `agent.execute`.
+
+The Worker MVP intentionally does not support email sending, browser control, app control, external publishing, payment/account actions, or autonomous high-risk external operations.
+
+Background service installation, richer confirmation policy for mutating local actions, artifact transfer, and full multi-worker orchestration remain future slices.
 
 Usage instructions are documented in:
 
@@ -453,6 +470,8 @@ The MVP is useful when a fresh user can:
 8. see an audit trail of important memory changes
 9. switch the Web UI between English and Simplified Chinese
 10. choose whether assistant replies follow the interface language, English, or Simplified Chinese
+11. pair a local worker with a short-lived pair code and see its status in the Web UI
+12. dispatch a policy-scoped `agent.execute` job to an online worker and inspect the job result and audit trail
 
 ## Next Design Slice
 

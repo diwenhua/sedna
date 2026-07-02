@@ -3,7 +3,7 @@ import type { MemoryCandidate, Message, ProfileAttribute, ProfilePatchProposal, 
 import { ExtractionResultSchema, type ExtractedMemoryCandidate, type ExtractedProfilePatchProposal } from "../llm/schemas.js";
 import type { LlmConversationInput, LlmProvider } from "../llm/provider.js";
 import { canUseAgentToolLoop, runChatWithWebTools, type ChatToolProgressEvent } from "../agent/chat-tool-loop.js";
-import { runWorkerActionFromMessage, buildWorkerInventoryContext } from "../agent/worker-actions.js";
+import { buildWorkerInventoryContext } from "../agent/worker-actions.js";
 import { resolveMessageMentions } from "./mentions.js";
 
 export interface ConversationMessageFlowInput {
@@ -77,18 +77,6 @@ export async function runConversationMessageFlow(
   const useAgentToolLoop = canUseAgentToolLoop(input.store);
   const activeMemories = useAgentToolLoop ? [] : input.store.listActiveMemoryNodes(input.content, 12);
   const workerInventory = buildWorkerInventoryContext(input.store);
-  let workerContext: string | undefined;
-  try {
-    workerContext = await runWorkerActionFromMessage({
-      store: input.store,
-      ownerMessage: input.content,
-      onProgress: async (event) => {
-        await input.onProgress?.(event);
-      }
-    });
-  } catch (error) {
-    await input.onProgress?.({ type: "error", message: normalizeError(error).message });
-  }
 
   let assistantContent: string;
   let assistantMetadata: Record<string, unknown>;
@@ -98,7 +86,6 @@ export async function runConversationMessageFlow(
     activeMemories,
     replyLocale,
     workerInventory,
-    workerContext,
     agentToolsEnabled: useAgentToolLoop,
     selectedSkills: resolvedMentions.skills.map((skill) => ({
       name: skill.name,
@@ -118,6 +105,9 @@ export async function runConversationMessageFlow(
       ? await runChatWithWebTools(replyInput, {
           store: input.store,
           fetchImpl: input.fetchImpl,
+          onDelta: async (delta) => {
+            await input.onProgress?.({ type: "assistant_delta", content: delta });
+          },
           onProgress: async (event: ChatToolProgressEvent) => {
             await input.onProgress?.(event);
           }

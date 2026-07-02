@@ -4,342 +4,6 @@ import { runConversationMessageFlow } from "./message-flow.js";
 import type { LlmProvider } from "../llm/provider.js";
 
 describe("conversation message flow", () => {
-  it("uses an online worker file.search result as reply context", async () => {
-    const store = createMemoryStore(":memory:");
-    store.migrate();
-    const conversation = store.createConversation("Worker search");
-    const worker = store.registerWorker({
-      displayName: "Test Worker",
-      environment: "local",
-      capabilities: [
-        {
-          name: "file.search",
-          risk: "low",
-          readOnly: true,
-          requiresConfirmation: false,
-          enabled: true,
-          allowedScopes: ["approved_paths"],
-          inputSchema: {},
-          outputSchema: {}
-        }
-      ],
-      pathScopes: [
-        {
-          label: "project",
-          path: "/tmp/sedna-worker",
-          mode: "read_only",
-          enabled: true
-        }
-      ]
-    });
-    let observedWorkerContext = "";
-    const workerPump = setInterval(() => {
-      for (const job of store.listWorkerJobs({ workerId: worker.id, status: "queued" })) {
-        store.startWorkerJob(worker.id, job.id);
-        store.completeWorkerJob(worker.id, job.id, {
-          matches: [
-            {
-              path: "/tmp/sedna-worker/README.md",
-              name: "README.md",
-              size: 123,
-              modified_at: "2026-06-30T00:00:00.000Z"
-            }
-          ]
-        });
-      }
-    }, 5);
-
-    try {
-      const result = await runConversationMessageFlow({
-        store,
-        provider: {
-          name: "worker-aware-fake",
-          async generateAssistantReply(input) {
-            observedWorkerContext = input.workerContext ?? "";
-            return { content: observedWorkerContext.includes("README.md") ? "找到了 README.md。" : "没有 worker 结果。", provider: "worker-aware-fake" };
-          },
-          async extractMemoryCandidates() {
-            return { candidates: [] };
-          }
-        },
-        conversationId: conversation.id,
-        content: "帮我在本地搜索 README"
-      });
-
-      expect(result.assistantMessage.content).toBe("找到了 README.md。");
-      expect(observedWorkerContext).toContain("file.search");
-      expect(observedWorkerContext).toContain("README.md");
-      expect(store.listWorkerJobs({ workerId: worker.id })[0]).toMatchObject({
-        capability: "file.search",
-        status: "completed"
-      });
-      expect(store.listEvents().map((event) => event.type)).toEqual(expect.arrayContaining([
-        "worker.job.created",
-        "worker.job.completed"
-      ]));
-    } finally {
-      clearInterval(workerPump);
-      store.close();
-    }
-  });
-
-  it("uses an online worker file.list result as reply context", async () => {
-    const store = createMemoryStore(":memory:");
-    store.migrate();
-    const conversation = store.createConversation("Worker list");
-    const worker = store.registerWorker({
-      displayName: "Test Worker",
-      environment: "local",
-      capabilities: [
-        {
-          name: "file.list",
-          risk: "low",
-          readOnly: true,
-          requiresConfirmation: false,
-          enabled: true,
-          allowedScopes: ["approved_paths"],
-          inputSchema: {},
-          outputSchema: {}
-        }
-      ],
-      pathScopes: [
-        {
-          label: "project",
-          path: "/tmp/sedna-worker",
-          mode: "read_only",
-          enabled: true
-        }
-      ]
-    });
-    let observedWorkerContext = "";
-    const workerPump = setInterval(() => {
-      for (const job of store.listWorkerJobs({ workerId: worker.id, status: "queued" })) {
-        store.startWorkerJob(worker.id, job.id);
-        store.completeWorkerJob(worker.id, job.id, {
-          path: "/tmp/sedna-worker",
-          entries: [
-            { path: "/tmp/sedna-worker/README.md", name: "README.md", type: "file", size: 123, modified_at: "2026-06-30T00:00:00.000Z" }
-          ],
-          truncated: false
-        });
-      }
-    }, 5);
-
-    try {
-      const result = await runConversationMessageFlow({
-        store,
-        provider: {
-          name: "worker-list-fake",
-          async generateAssistantReply(input) {
-            observedWorkerContext = input.workerContext ?? "";
-            return { content: observedWorkerContext.includes("file.list") && observedWorkerContext.includes("README.md") ? "目录里有 README.md。" : "没有目录结果。", provider: "worker-list-fake" };
-          },
-          async extractMemoryCandidates() {
-            return { candidates: [] };
-          }
-        },
-        conversationId: conversation.id,
-        content: "列出 /tmp/sedna-worker 下面有哪些文件"
-      });
-
-      expect(result.assistantMessage.content).toBe("目录里有 README.md。");
-      expect(observedWorkerContext).toContain("file.list");
-      expect(store.listWorkerJobs({ workerId: worker.id })[0]).toMatchObject({
-        capability: "file.list",
-        status: "completed"
-      });
-    } finally {
-      clearInterval(workerPump);
-      store.close();
-    }
-  });
-
-  it("prefers file.list when the message mentions Local Worker and files", async () => {
-    const store = createMemoryStore(":memory:");
-    store.migrate();
-    const conversation = store.createConversation("Local Worker list");
-    const worker = store.registerWorker({
-      displayName: "Local Worker",
-      environment: "local",
-      capabilities: [
-        {
-          name: "file.list",
-          risk: "low",
-          readOnly: true,
-          requiresConfirmation: false,
-          enabled: true,
-          allowedScopes: ["approved_paths"]
-        },
-        {
-          name: "worker.status",
-          risk: "low",
-          readOnly: true,
-          requiresConfirmation: false,
-          enabled: true,
-          allowedScopes: ["self"]
-        }
-      ],
-      pathScopes: [
-        { label: "project", path: "/tmp/sedna-worker", mode: "read_only", enabled: true }
-      ]
-    });
-    let observedWorkerContext = "";
-    const workerPump = setInterval(() => {
-      for (const job of store.listWorkerJobs({ workerId: worker.id, status: "queued" })) {
-        store.startWorkerJob(worker.id, job.id);
-        store.completeWorkerJob(worker.id, job.id, {
-          path: "/tmp/sedna-worker",
-          entries: [{ path: "/tmp/sedna-worker/README.md", name: "README.md", type: "file", size: 1, modified_at: "2026-06-30T00:00:00.000Z" }],
-          truncated: false
-        });
-      }
-    }, 5);
-
-    try {
-      const result = await runConversationMessageFlow({
-        store,
-        provider: {
-          name: "local-worker-list-fake",
-          async generateAssistantReply(input) {
-            observedWorkerContext = input.workerContext ?? "";
-            return {
-              content: observedWorkerContext.includes("file.list") ? "已列出 Local Worker 文件。" : "没有 file.list 结果。",
-              provider: "local-worker-list-fake"
-            };
-          },
-          async extractMemoryCandidates() {
-            return { candidates: [] };
-          }
-        },
-        conversationId: conversation.id,
-        content: "列出 Local Worker 允许路径下有哪些文件"
-      });
-
-      expect(observedWorkerContext).toContain("file.list");
-      expect(result.assistantMessage.content).toContain("已列出");
-    } finally {
-      clearInterval(workerPump);
-      store.close();
-    }
-  });
-
-  it("reads an explicit local file path without including trailing Chinese text in the path", async () => {
-    const store = createMemoryStore(":memory:");
-    store.migrate();
-    const conversation = store.createConversation("Worker read");
-    const worker = store.registerWorker({
-      displayName: "Test Worker",
-      environment: "local",
-      capabilities: [
-        {
-          name: "file.read",
-          risk: "medium",
-          readOnly: true,
-          requiresConfirmation: false,
-          enabled: true,
-          allowedScopes: ["approved_paths"],
-          inputSchema: {},
-          outputSchema: {}
-        }
-      ],
-      pathScopes: [
-        { label: "project", path: "/tmp/sedna-worker", mode: "read_only", enabled: true }
-      ]
-    });
-    let createdInput: Record<string, unknown> | undefined;
-    const workerPump = setInterval(() => {
-      for (const job of store.listWorkerJobs({ workerId: worker.id, status: "queued" })) {
-        createdInput = job.input;
-        store.startWorkerJob(worker.id, job.id);
-        store.completeWorkerJob(worker.id, job.id, {
-          path: "/tmp/sedna-worker/README.zh-CN.md",
-          content: "# Sedna 中文说明",
-          truncated: false,
-          size: 14
-        });
-      }
-    }, 5);
-
-    try {
-      const result = await runConversationMessageFlow({
-        store,
-        provider: {
-          name: "worker-read-fake",
-          async generateAssistantReply(input) {
-            return { content: input.workerContext?.includes("Sedna 中文说明") ? "读到了中文 README。" : "没有读取结果。", provider: "worker-read-fake" };
-          },
-          async extractMemoryCandidates() {
-            return { candidates: [] };
-          }
-        },
-        conversationId: conversation.id,
-        content: "读取 /tmp/sedna-worker/README.zh-CN.md里面都写了什么？"
-      });
-
-      expect(result.assistantMessage.content).toBe("读到了中文 README。");
-      expect(createdInput).toMatchObject({ path: "/tmp/sedna-worker/README.zh-CN.md" });
-    } finally {
-      clearInterval(workerPump);
-      store.close();
-    }
-  });
-
-  it("uses the most specific worker path scope for file.search", async () => {
-    const store = createMemoryStore(":memory:");
-    store.migrate();
-    const conversation = store.createConversation("Worker search scope");
-    const worker = store.registerWorker({
-      displayName: "Test Worker",
-      environment: "local",
-      capabilities: [
-        {
-          name: "file.search",
-          risk: "low",
-          readOnly: true,
-          requiresConfirmation: false,
-          enabled: true,
-          allowedScopes: ["approved_paths"],
-          inputSchema: {},
-          outputSchema: {}
-        }
-      ],
-      pathScopes: [
-        { label: "old-wide", path: "/tmp", mode: "read_only", enabled: true },
-        { label: "project", path: "/tmp/sedna-worker", mode: "read_only", enabled: true }
-      ]
-    });
-    let createdInput: Record<string, unknown> | undefined;
-    const workerPump = setInterval(() => {
-      for (const job of store.listWorkerJobs({ workerId: worker.id, status: "queued" })) {
-        createdInput = job.input;
-        store.startWorkerJob(worker.id, job.id);
-        store.completeWorkerJob(worker.id, job.id, { matches: [] });
-      }
-    }, 5);
-
-    try {
-      await runConversationMessageFlow({
-        store,
-        provider: {
-          name: "worker-search-scope-fake",
-          async generateAssistantReply() {
-            return { content: "搜索完成。", provider: "worker-search-scope-fake" };
-          },
-          async extractMemoryCandidates() {
-            return { candidates: [] };
-          }
-        },
-        conversationId: conversation.id,
-        content: "帮我在本地搜索 README"
-      });
-
-      expect(createdInput).toMatchObject({ paths: ["/tmp/sedna-worker"] });
-    } finally {
-      clearInterval(workerPump);
-      store.close();
-    }
-  });
-
   it("includes registered worker inventory in reply context when the owner asks about workers", async () => {
     const store = createMemoryStore(":memory:");
     store.migrate();
@@ -350,8 +14,8 @@ describe("conversation message flow", () => {
       hostName: "mac.local",
       capabilities: [
         {
-          name: "file.list",
-          risk: "low",
+          name: "agent.execute",
+          risk: "medium",
           readOnly: true,
           requiresConfirmation: false,
           enabled: true,
@@ -384,13 +48,12 @@ describe("conversation message flow", () => {
     });
 
     expect(observedInventory).toContain("Home Mac");
-    expect(observedInventory).toContain("file.list");
-    expect(observedInventory).toContain("/Users/me/Documents");
+    expect(observedInventory).toContain("agent.execute");
     expect(result.assistantMessage.content).toContain("Home Mac");
     store.close();
   });
 
-  it("returns worker status context for online checks even when the worker is offline", async () => {
+  it("includes offline worker status in the registered worker inventory context", async () => {
     const store = createMemoryStore(":memory:");
     store.migrate();
     const conversation = store.createConversation("Worker online check");
@@ -399,25 +62,25 @@ describe("conversation message flow", () => {
       environment: "local",
       capabilities: [
         {
-          name: "worker.status",
-          risk: "low",
+          name: "agent.execute",
+          risk: "medium",
           readOnly: true,
           requiresConfirmation: false,
           enabled: true,
-          allowedScopes: ["self"]
+          allowedScopes: ["approved_paths"]
         }
       ]
     });
     store.updateWorker(worker.id, { status: "offline" });
-    let observedWorkerContext = "";
+    let observedInventory = "";
     const result = await runConversationMessageFlow({
       store,
       provider: {
         name: "worker-status-fake",
         async generateAssistantReply(input) {
-          observedWorkerContext = input.workerContext ?? "";
+          observedInventory = input.workerInventory ?? "";
           return {
-            content: observedWorkerContext.includes("status=offline") ? "Worker 当前离线。" : "无法判断 Worker 状态。",
+            content: observedInventory.includes("status=offline") ? "Worker 当前离线。" : "无法判断 Worker 状态。",
             provider: "worker-status-fake"
           };
         },
@@ -429,7 +92,7 @@ describe("conversation message flow", () => {
       content: "Worker 现在在线吗？"
     });
 
-    expect(observedWorkerContext).toContain("status=offline");
+    expect(observedInventory).toContain("status=offline");
     expect(result.assistantMessage.content).toContain("离线");
     store.close();
   });

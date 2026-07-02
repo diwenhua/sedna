@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -37,19 +37,16 @@ import type {
   RiskLevel,
   UiLocale,
   Worker,
-  WorkerJob,
-  WorkerPathScope
+  WorkerJob
 } from "@sedna/protocol";
 import {
   approveCandidate,
   createWorkerPairCode,
-  createWorkerPathScope,
   createLlmProvider,
   createMcpServer,
   createConversation,
   deleteConversation,
   deleteSkill,
-  deleteWorkerPathScope,
   disableLlmProvider,
   disableMcpServer,
   editCandidate,
@@ -74,7 +71,6 @@ import {
   patchLlmRoute,
   patchSettings,
   patchWorkerCapability,
-  patchWorkerPathScope,
   patchWebToolsSettings,
   patchSkill,
   patchToolPolicy,
@@ -626,57 +622,6 @@ export function App() {
     }
   }
 
-  async function handleCreateWorkerPathScope(workerId: string, input: { label: string; path: string }) {
-    try {
-      const scope = await createWorkerPathScope(workerId, {
-        label: input.label,
-        path: input.path,
-        mode: "read_only",
-        enabled: true
-      });
-      setWorkerDetails((current) => current.map((detail) => detail.worker.id === workerId ? {
-        ...detail,
-        pathScopes: [...detail.pathScopes, scope]
-      } : detail));
-      setStatus(t("workerPolicySaved"));
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : t("workerPolicySaveFailed"));
-    }
-  }
-
-  async function handlePatchWorkerPathScope(
-    workerId: string,
-    scope: WorkerPathScope,
-    patch: Partial<{ label: string; path: string; enabled: boolean }>
-  ) {
-    try {
-      const updated = await patchWorkerPathScope(workerId, scope.id, patch);
-      setWorkerDetails((current) => current.map((detail) => detail.worker.id === workerId ? {
-        ...detail,
-        pathScopes: detail.pathScopes.map((item) => item.id === updated.id ? updated : item)
-      } : detail));
-      setStatus(t("workerPolicySaved"));
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : t("workerPolicySaveFailed"));
-    }
-  }
-
-  async function handleDeleteWorkerPathScope(workerId: string, scope: WorkerPathScope) {
-    if (!window.confirm(t("confirmDeleteWorkerPathScope"))) {
-      return;
-    }
-    try {
-      await deleteWorkerPathScope(workerId, scope.id);
-      setWorkerDetails((current) => current.map((detail) => detail.worker.id === workerId ? {
-        ...detail,
-        pathScopes: detail.pathScopes.filter((item) => item.id !== scope.id)
-      } : detail));
-      setStatus(t("workerPolicySaved"));
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : t("workerPolicySaveFailed"));
-    }
-  }
-
   async function handleEdit(candidate: MemoryCandidate) {
     const label = window.prompt(t("editMemoryLabel"), candidate.label);
     if (!label || label === candidate.label) {
@@ -1023,9 +968,6 @@ export function App() {
               onCreatePairCode={() => void handleCreateWorkerPairCode()}
               onRevokeWorker={(worker) => void handleRevokeWorker(worker)}
               onPatchCapability={(workerId, capability, patch) => void handlePatchWorkerCapability(workerId, capability, patch)}
-              onCreatePathScope={(workerId, input) => void handleCreateWorkerPathScope(workerId, input)}
-              onPatchPathScope={(workerId, scope, patch) => void handlePatchWorkerPathScope(workerId, scope, patch)}
-              onDeletePathScope={(workerId, scope) => void handleDeleteWorkerPathScope(workerId, scope)}
               t={t}
               locale={settings.uiLocale}
             />
@@ -1182,6 +1124,9 @@ function ChatTimeline({
   const [mentionQuery, setMentionQuery] = useState("");
   const [mentionIndex, setMentionIndex] = useState(0);
   const visibleActivities = selectVisibleChatActivities(activities);
+  const scrollKey = messages.map((message) =>
+    `${message.id}:${message.content.length}:${String(message.metadata.pending ?? false)}`
+  ).join("|");
   const openConfirmations = confirmations.filter((item) => item.status === "pending").slice(0, 2);
   const suggestedTasks = chatRunInProgress
     ? tasks.filter((task) => task.status === "suggested").slice(0, 1)
@@ -1192,12 +1137,13 @@ function ChatTimeline({
     [mentionQuery, skills, tools]
   );
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const list = messageListRef.current;
-    if (list) {
-      list.scrollTop = list.scrollHeight;
+    if (!list) {
+      return;
     }
-  }, [messages.length, visibleActivities.length]);
+    list.scrollTop = list.scrollHeight;
+  }, [scrollKey, visibleActivities.length]);
 
   useEffect(() => {
     setMentionIndex(0);
@@ -1464,9 +1410,6 @@ function WorkerPanel({
   onCreatePairCode,
   onRevokeWorker,
   onPatchCapability,
-  onCreatePathScope,
-  onPatchPathScope,
-  onDeletePathScope,
   t,
   locale
 }: {
@@ -1479,9 +1422,6 @@ function WorkerPanel({
     capability: Capability,
     patch: Partial<{ enabled: boolean; risk: RiskLevel; requires_confirmation: boolean }>
   ) => void;
-  onCreatePathScope: (workerId: string, input: { label: string; path: string }) => void;
-  onPatchPathScope: (workerId: string, scope: WorkerPathScope, patch: Partial<{ label: string; path: string; enabled: boolean }>) => void;
-  onDeletePathScope: (workerId: string, scope: WorkerPathScope) => void;
   t: (key: TranslationKey) => string;
   locale: UiLocale;
 }) {
@@ -1507,9 +1447,6 @@ function WorkerPanel({
             key={detail.worker.id}
             onRevokeWorker={onRevokeWorker}
             onPatchCapability={onPatchCapability}
-            onCreatePathScope={onCreatePathScope}
-            onPatchPathScope={onPatchPathScope}
-            onDeletePathScope={onDeletePathScope}
             t={t}
             locale={locale}
           />
@@ -1523,9 +1460,6 @@ function WorkerCard({
   detail,
   onRevokeWorker,
   onPatchCapability,
-  onCreatePathScope,
-  onPatchPathScope,
-  onDeletePathScope,
   t,
   locale
 }: {
@@ -1536,14 +1470,10 @@ function WorkerCard({
     capability: Capability,
     patch: Partial<{ enabled: boolean; risk: RiskLevel; requires_confirmation: boolean }>
   ) => void;
-  onCreatePathScope: (workerId: string, input: { label: string; path: string }) => void;
-  onPatchPathScope: (workerId: string, scope: WorkerPathScope, patch: Partial<{ label: string; path: string; enabled: boolean }>) => void;
-  onDeletePathScope: (workerId: string, scope: WorkerPathScope) => void;
   t: (key: TranslationKey) => string;
   locale: UiLocale;
 }) {
   const { worker } = detail;
-  const [pathDraft, setPathDraft] = useState({ label: "", path: "" });
   return (
     <article className={`worker-card ${worker.status}`}>
       <div className="worker-card-header">
@@ -1565,8 +1495,8 @@ function WorkerCard({
         {worker.os && <span>{t("os")}: {worker.os}</span>}
       </div>
       <WorkerSection title={t("capabilities")} stack>
-        {detail.capabilities.length === 0 && <span className="muted-text">{t("none")}</span>}
-        {detail.capabilities.map((capability) => (
+        {visibleWorkerCapabilities(detail.capabilities).length === 0 && <span className="muted-text">{t("none")}</span>}
+        {visibleWorkerCapabilities(detail.capabilities).map((capability) => (
           <WorkerCapabilityRow
             capability={capability}
             key={capability.id}
@@ -1574,43 +1504,6 @@ function WorkerCard({
             t={t}
           />
         ))}
-      </WorkerSection>
-      <WorkerSection title={t("allowedPaths")} stack>
-        {detail.pathScopes.length === 0 && <span className="muted-text">{t("noAllowedPaths")}</span>}
-        {detail.pathScopes.map((scope) => (
-          <WorkerPathScopeRow
-            key={scope.id}
-            onDelete={() => onDeletePathScope(worker.id, scope)}
-            onPatch={(patch) => onPatchPathScope(worker.id, scope, patch)}
-            scope={scope}
-            t={t}
-          />
-        ))}
-        <form
-          className="worker-path-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            const label = pathDraft.label.trim();
-            const pathValue = pathDraft.path.trim();
-            if (!label || !pathValue) {
-              return;
-            }
-            onCreatePathScope(worker.id, { label, path: pathValue });
-            setPathDraft({ label: "", path: "" });
-          }}
-        >
-          <input
-            placeholder={t("pathScopeLabel")}
-            value={pathDraft.label}
-            onChange={(event) => setPathDraft((current) => ({ ...current, label: event.target.value }))}
-          />
-          <input
-            placeholder={t("pathScopePath")}
-            value={pathDraft.path}
-            onChange={(event) => setPathDraft((current) => ({ ...current, path: event.target.value }))}
-          />
-          <button className="ghost-button" type="submit"><Plus size={14} /> {t("addPathScope")}</button>
-        </form>
       </WorkerSection>
       <WorkerSection title={t("recentJobs")} stack>
         {detail.recentJobs.length === 0 && <span className="muted-text">{t("noWorkerJobs")}</span>}
@@ -1659,62 +1552,6 @@ function WorkerCapabilityRow({
         />
         {t("enabled")}
       </label>
-    </div>
-  );
-}
-
-function WorkerPathScopeRow({
-  scope,
-  onPatch,
-  onDelete,
-  t
-}: {
-  scope: WorkerPathScope;
-  onPatch: (patch: Partial<{ label: string; path: string; enabled: boolean }>) => void;
-  onDelete: () => void;
-  t: (key: TranslationKey) => string;
-}) {
-  const [label, setLabel] = useState(scope.label);
-  const [pathValue, setPathValue] = useState(scope.path);
-
-  useEffect(() => {
-    setLabel(scope.label);
-    setPathValue(scope.path);
-  }, [scope.label, scope.path]);
-
-  return (
-    <div className="worker-path-scope-row">
-      <input
-        value={label}
-        onChange={(event) => setLabel(event.target.value)}
-        onBlur={() => {
-          const next = label.trim();
-          if (next && next !== scope.label) {
-            onPatch({ label: next });
-          }
-        }}
-      />
-      <input
-        value={pathValue}
-        onChange={(event) => setPathValue(event.target.value)}
-        onBlur={() => {
-          const next = pathValue.trim();
-          if (next && next !== scope.path) {
-            onPatch({ path: next });
-          }
-        }}
-      />
-      <label className="route-enabled">
-        <input
-          checked={scope.enabled}
-          onChange={(event) => onPatch({ enabled: event.target.checked })}
-          type="checkbox"
-        />
-        {t("enabled")}
-      </label>
-      <button className="icon-button danger" onClick={onDelete} title={t("deletePathScope")} aria-label={t("deletePathScope")} type="button">
-        <Trash2 size={14} />
-      </button>
     </div>
   );
 }
@@ -2815,6 +2652,11 @@ function parseHeaderDraft(value: string): Record<string, string> {
   }
 }
 
+function visibleWorkerCapabilities(capabilities: Capability[]): Capability[] {
+  const supported = new Set(["worker.status", "agent.execute"]);
+  return capabilities.filter((capability) => supported.has(capability.name));
+}
+
 function routePurposeLabel(purpose: LlmRoutePurpose, t: (key: TranslationKey) => string): string {
   switch (purpose) {
     case "chat_reply":
@@ -2844,8 +2686,11 @@ function buildToolActivityTitle(
   if (tool === "memory_search") {
     return options.query ? `${t("searchingMemories")}: ${options.query}` : t("searchingMemories");
   }
-  if (tool.startsWith("file.") || tool === "worker.status") {
-    return `${options.fallbackTitle ?? tool}${options.query ? `: ${options.query}` : ""}${options.url ? `: ${options.url}` : ""}`;
+  if (tool === "worker_dispatch_task") {
+    return options.query ? `${t("workerDispatchActivity")}: ${options.query}` : t("workerDispatchActivity");
+  }
+  if (tool === "worker.status") {
+    return options.fallbackTitle ?? t("workerStatusActivity");
   }
   if (phase === "search" || tool === "web_search") {
     return options.query ? `${t("webSearchActivity")}: ${options.query}` : t("webSearchActivity");

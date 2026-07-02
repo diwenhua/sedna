@@ -90,7 +90,7 @@ Current implementation slice:
 - TypeScript + pnpm workspace monorepo
 - Central Brain API server in `apps/brain`
 - React + Vite Web UI in `apps/web`
-- read-only Worker MVP runtime in `apps/worker`
+- policy-scoped Worker Agent runtime in `apps/worker`
 - CLI skeleton in `apps/cli`
 - shared protocol, memory, policy, and utility packages under `packages/`
 - SQLite-backed canonical memory graph schema and migrations
@@ -134,7 +134,7 @@ curl -s -X POST http://127.0.0.1:8787/api/workers/pair-codes \
   -d '{"ttl_ms":600000}'
 ```
 
-Pair a local read-only Worker in another terminal:
+Pair a local Worker in another terminal:
 
 ```bash
 SEDNA_BRAIN_URL=http://127.0.0.1:8787 \
@@ -155,7 +155,7 @@ Then open the Workers page:
 http://127.0.0.1:5173/workers
 ```
 
-Worker MVP details, supported capabilities, API examples, and safety rules are documented in [docs/worker-mvp-usage.md](docs/worker-mvp-usage.md).
+Worker MVP details, supported capabilities, API examples, and safety rules are documented in [docs/worker-mvp-usage.md](docs/worker-mvp-usage.md). The current Worker surface exposes `worker.status` and `agent.execute` to Brain; the local Worker Agent performs file and command operations only inside its runtime policy.
 
 LLM configuration:
 
@@ -197,7 +197,9 @@ Major design areas still being refined:
 - permission policy model
 - artifact storage and transfer
 - owner authentication and recovery
-- worker registration, revocation, and offline behavior
+- worker policy convergence between Brain-managed scopes and runtime enforcement
+- confirmation rules for mutating Worker Agent actions
+- worker background service installation and offline behavior
 - model/provider routing and sensitive-data handling
 - backup, restore, and migration
 

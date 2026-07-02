@@ -253,7 +253,7 @@ The MVP should not include:
 - embeddings or vector retrieval
 - streaming token output
 - tool calling for external actions
-- autonomous worker execution triggered by the model
+- uncontrolled worker execution triggered by the model
 - self-modifying prompts
 
 Those can be added after the Brain memory loop works.

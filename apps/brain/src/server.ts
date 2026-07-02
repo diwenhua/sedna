@@ -99,7 +99,7 @@ const RegisterMockWorkerBody = z.object({
 });
 
 const WorkerCapabilityBody = z.object({
-  name: z.enum(["worker.status", "file.search", "file.read", "file.list"]),
+  name: z.enum(["worker.status", "agent.execute"]),
   risk: z.enum(["low", "medium", "high"]).default("low"),
   read_only: z.boolean().default(true),
   requires_confirmation: z.boolean().default(false),
@@ -160,7 +160,7 @@ const OwnerWorkerPathScopePatchBody = z.object({
 
 const CreateWorkerJobBody = z.object({
   worker_id: z.string().min(1),
-  capability: z.enum(["worker.status", "file.search", "file.read", "file.list"]),
+  capability: z.enum(["worker.status", "agent.execute"]),
   input: z.record(z.unknown()).default({}),
   timeout_ms: z.number().int().min(1000).max(300000).default(30000)
 });
@@ -575,6 +575,17 @@ export async function buildBrainServer(options: BrainServerOptions = {}): Promis
     return reply.status(201).send(store.declareWorkerCapability(id, fromWorkerCapabilityBody(body)));
   });
 
+  app.post("/api/workers/:id/capabilities/sync", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!requireWorkerCredential(id, request, reply)) {
+      return;
+    }
+    const body = z.object({
+      capabilities: z.array(WorkerCapabilityBody).default([])
+    }).parse(request.body ?? {});
+    return reply.send(store.syncWorkerCapabilities(id, body.capabilities.map(fromWorkerCapabilityBody)));
+  });
+
   app.patch("/api/workers/:id/capabilities/:capabilityId", async (request, reply) => {
     const { id, capabilityId } = request.params as { id: string; capabilityId: string };
     const body = OwnerWorkerCapabilityPatchBody.parse(request.body ?? {});
@@ -635,6 +646,18 @@ export async function buildBrainServer(options: BrainServerOptions = {}): Promis
       return;
     }
     return store.getWorkerPolicy(id);
+  });
+
+  app.get("/api/workers/:id/agent-llm", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!requireWorkerCredential(id, request, reply)) {
+      return;
+    }
+    const config = store.getWorkerAgentLlmConfig();
+    if (!config) {
+      return reply.status(503).send({ error: "Brain chat LLM is not configured for worker agent execution." });
+    }
+    return config;
   });
 
   app.get("/api/workers/:id/jobs/pending", async (request, reply) => {

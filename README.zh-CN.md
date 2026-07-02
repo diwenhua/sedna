@@ -90,7 +90,7 @@ Web UI
 - TypeScript + pnpm workspace monorepo
 - `apps/brain` 中的中央大脑 API 服务
 - `apps/web` 中的 React + Vite Web UI
-- `apps/worker` 中的只读 Worker MVP runtime
+- `apps/worker` 中受策略约束的 Worker Agent runtime
 - `apps/cli` 中的 CLI 骨架
 - `packages/` 下的共享 protocol、memory、policy 和工具包
 - 基于 SQLite 的规范记忆图 schema 和 migration
@@ -134,7 +134,7 @@ curl -s -X POST http://127.0.0.1:8787/api/workers/pair-codes \
   -d '{"ttl_ms":600000}'
 ```
 
-再另开一个终端配对本地只读 Worker：
+再另开一个终端配对本地 Worker：
 
 ```bash
 SEDNA_BRAIN_URL=http://127.0.0.1:8787 \
@@ -155,7 +155,7 @@ pnpm dev:worker
 http://127.0.0.1:5173/workers
 ```
 
-Worker MVP 的详细启动方式、支持能力、API 示例和安全规则见 [docs/worker-mvp-usage.zh-CN.md](docs/worker-mvp-usage.zh-CN.md)。
+Worker MVP 的详细启动方式、支持能力、API 示例和安全规则见 [docs/worker-mvp-usage.zh-CN.md](docs/worker-mvp-usage.zh-CN.md)。当前 Brain 可见的 Worker 能力是 `worker.status` 和 `agent.execute`；本地 Worker Agent 只在 runtime policy 允许范围内执行文件和命令操作。
 
 LLM 配置：
 
@@ -197,7 +197,9 @@ apps/worker/.local/
 - 权限策略模型
 - 产物存储和传输
 - 用户认证和恢复
-- Worker 注册、撤销和离线行为
+- Brain 管理的 scope 与 Worker runtime 实际执行策略如何收敛
+- Worker Agent 变更类动作的确认规则
+- Worker 后台服务安装和离线行为
 - 模型/provider 路由和敏感数据处理
 - 备份、恢复和迁移
 

@@ -3,6 +3,7 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { executeWorkerCapability, parseAllowedPaths, type WorkerRuntimePolicy } from "./capabilities.js";
+import type { WorkerAgentLlmConfig } from "./agent-loop.js";
 
 interface WorkerState {
   workerId?: string;
@@ -104,12 +105,7 @@ async function pairWorker(): Promise<void> {
       os: `${os.type()} ${os.release()}`,
       metadata: { arch: os.arch(), platform: os.platform() },
       capabilities: capabilityDeclarations(),
-      path_scopes: allowedPaths().map((allowedPath) => ({
-        label: path.basename(allowedPath) || allowedPath,
-        path: allowedPath,
-        mode: "read_only",
-        enabled: true
-      }))
+      path_scopes: []
     })
   });
   await saveState({ workerId: response.worker.id, credential: response.credential });
@@ -141,13 +137,11 @@ async function syncPolicy(workerId: string, credential: string): Promise<void> {
 }
 
 async function syncCapabilities(workerId: string, credential: string): Promise<void> {
-  for (const capability of capabilityDeclarations()) {
-    await api(`/api/workers/${encodeURIComponent(workerId)}/capabilities`, {
-      method: "POST",
-      credential,
-      body: JSON.stringify(capability)
-    });
-  }
+  await api(`/api/workers/${encodeURIComponent(workerId)}/capabilities/sync`, {
+    method: "POST",
+    credential,
+    body: JSON.stringify({ capabilities: capabilityDeclarations() })
+  });
 }
 
 async function pollOnce(workerId: string, credential: string): Promise<void> {
@@ -161,7 +155,11 @@ async function runJob(workerId: string, credential: string, job: WorkerJob): Pro
   await api(`/api/workers/${encodeURIComponent(workerId)}/jobs/${encodeURIComponent(job.id)}/start`, { method: "POST", credential });
   try {
     const result = await withTimeout(
-      executeWorkerCapability(job.capability, job.input, runtimePolicy()),
+      executeWorkerCapability(job.capability, job.input, {
+        policy: runtimePolicy(),
+        fetchAgentLlm: () => fetchAgentLlm(workerId, credential),
+        fetchImpl: fetch
+      }),
       job.timeoutMs
     );
     await api(`/api/workers/${encodeURIComponent(workerId)}/jobs/${encodeURIComponent(job.id)}/complete`, {
@@ -191,54 +189,19 @@ function capabilityDeclarations() {
       output_schema: {}
     },
     {
-      name: "file.list",
-      risk: "low",
-      read_only: true,
+      name: "agent.execute",
+      risk: "high",
+      read_only: false,
       requires_confirmation: false,
-      enabled: allowedPaths().length > 0,
-      allowed_scopes: ["approved_paths"],
+      enabled: true,
+      allowed_scopes: ["self"],
       input_schema: {
         type: "object",
         properties: {
-          path: { type: "string" },
-          max_entries: { type: "number" }
+          goal: { type: "string" },
+          context: { type: "string" }
         },
-        required: ["path"]
-      },
-      output_schema: { type: "object" }
-    },
-    {
-      name: "file.search",
-      risk: "low",
-      read_only: true,
-      requires_confirmation: false,
-      enabled: allowedPaths().length > 0,
-      allowed_scopes: ["approved_paths"],
-      input_schema: {
-        type: "object",
-        properties: {
-          query: { type: "string" },
-          paths: { type: "array", items: { type: "string" } },
-          max_results: { type: "number" }
-        },
-        required: ["query", "paths"]
-      },
-      output_schema: { type: "object" }
-    },
-    {
-      name: "file.read",
-      risk: "medium",
-      read_only: true,
-      requires_confirmation: false,
-      enabled: allowedPaths().length > 0,
-      allowed_scopes: ["approved_paths"],
-      input_schema: {
-        type: "object",
-        properties: {
-          path: { type: "string" },
-          max_bytes: { type: "number" }
-        },
-        required: ["path"]
+        required: ["goal"]
       },
       output_schema: { type: "object" }
     }
@@ -246,37 +209,16 @@ function capabilityDeclarations() {
 }
 
 function runtimePolicy(): WorkerRuntimePolicy {
-  const brainPaths = (cachedPolicy?.pathScopes ?? [])
-    .filter((scope) => scope.enabled && scope.mode === "read_only")
-    .map((scope) => path.resolve(scope.path));
-  const localPaths = allowedPaths();
-  const effectivePaths = resolveEffectivePaths(brainPaths, localPaths);
+  const optionalRoots = allowedPaths();
   return {
-    allowedPaths: effectivePaths,
+    allowedPaths: optionalRoots,
     maxReadBytes: intEnv("SEDNA_WORKER_MAX_READ_BYTES", 200000),
+    maxWriteBytes: intEnv("SEDNA_WORKER_MAX_WRITE_BYTES", 500000),
     maxSearchResults: intEnv("SEDNA_WORKER_MAX_SEARCH_RESULTS", 50),
-    maxListEntries: intEnv("SEDNA_WORKER_MAX_LIST_ENTRIES", 200)
+    maxListEntries: intEnv("SEDNA_WORKER_MAX_LIST_ENTRIES", 200),
+    maxCommandMs: intEnv("SEDNA_WORKER_MAX_COMMAND_MS", 120000),
+    maxCommandOutputBytes: intEnv("SEDNA_WORKER_MAX_COMMAND_OUTPUT_BYTES", 200000)
   };
-}
-
-function resolveEffectivePaths(brainPaths: string[], localPaths: string[]): string[] {
-  if (brainPaths.length === 0) {
-    return localPaths;
-  }
-  if (localPaths.length === 0) {
-    return brainPaths;
-  }
-  return brainPaths.filter((brainPath) =>
-    localPaths.some((localPath) => pathsOverlap(brainPath, localPath))
-  );
-}
-
-function pathsOverlap(left: string, right: string): boolean {
-  const normalizedLeft = path.resolve(left);
-  const normalizedRight = path.resolve(right);
-  return normalizedLeft === normalizedRight
-    || normalizedLeft.startsWith(`${normalizedRight}${path.sep}`)
-    || normalizedRight.startsWith(`${normalizedLeft}${path.sep}`);
 }
 
 function allowedPaths(): string[] {
@@ -285,6 +227,10 @@ function allowedPaths(): string[] {
 
 function brainUrl(): string {
   return (process.env.SEDNA_BRAIN_URL ?? "http://127.0.0.1:8787").replace(/\/+$/, "");
+}
+
+async function fetchAgentLlm(workerId: string, credential: string): Promise<WorkerAgentLlmConfig> {
+  return api<WorkerAgentLlmConfig>(`/api/workers/${encodeURIComponent(workerId)}/agent-llm`, { credential });
 }
 
 async function api<T = unknown>(pathname: string, init: RequestInit & { credential?: string } = {}): Promise<T> {

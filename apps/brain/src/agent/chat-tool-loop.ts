@@ -1,11 +1,17 @@
 import type { MemoryStore } from "@sedna/memory";
 import type { LlmProviderConfigSecret } from "@sedna/memory";
 import type { LlmModelRoute, ToolRegistryEntry } from "@sedna/protocol";
+import { readSseStream } from "../llm/sse.js";
 import { buildChatMessages } from "../llm/prompts/chat.js";
 import type { LlmConversationInput, LlmTextResult } from "../llm/provider.js";
 import { McpClient } from "../mcp/client.js";
 import { executeTool } from "../tools/tool-executor.js";
 import { readOwnerProfile, searchActiveMemories } from "./agent-context-tools.js";
+import {
+  buildWorkerAgentToolDefinitions,
+  executeWorkerDispatchTask,
+  summarizeWorkerDispatchTask
+} from "./agent-worker-tools.js";
 import { executeInternalTool } from "../tools/internal-tools.js";
 import { isWebToolsConfigured } from "../tools/web/index.js";
 
@@ -96,6 +102,13 @@ export interface ChatToolLoopOptions {
   store: MemoryStore;
   fetchImpl?: typeof fetch;
   onProgress?: (event: ChatToolProgressEvent) => void | Promise<void>;
+  onDelta?: (delta: string) => void | Promise<void>;
+}
+
+interface ModelTurnResult {
+  response: unknown;
+  toolCalls: ParsedToolCall[];
+  text: string;
 }
 
 function supportsToolCallingProvider(store: MemoryStore): boolean {
@@ -141,6 +154,14 @@ function buildAgentToolDefinitions(store: MemoryStore, input: LlmConversationInp
       tools.push(tool);
       reserved.add(tool.name);
     }
+  }
+
+  for (const tool of buildWorkerAgentToolDefinitions(store)) {
+    if (reserved.has(tool.name)) {
+      continue;
+    }
+    tools.push(tool);
+    reserved.add(tool.name);
   }
 
   for (const tool of resolveMcpToolsForLoop(store, input)) {
@@ -207,34 +228,50 @@ export async function runChatWithWebTools(
   }));
 
   while (true) {
-    const response = await callModelWithTools(provider, route, transcript, toolDefinitions, fetchImpl);
-    const toolCalls = extractToolCalls(provider.adapterType, response);
-    if (toolCalls.length === 0) {
+    const turn = await callModelWithTools(
+      provider,
+      route,
+      transcript,
+      toolDefinitions,
+      fetchImpl,
+      options.onDelta
+    );
+    if (turn.toolCalls.length === 0) {
       return {
-        content: extractAssistantText(provider.adapterType, response),
+        content: turn.text,
         provider: provider.displayName,
         model: route.model
       };
     }
 
-    transcript = appendToolRound(provider.adapterType, transcript, response, toolCalls);
-    for (const toolCall of toolCalls) {
+    transcript = appendToolRound(provider.adapterType, transcript, turn.response, turn.toolCalls);
+    const toolResults: Array<{ toolCall: ParsedToolCall; observation: Record<string, unknown> }> = [];
+    for (const toolCall of turn.toolCalls) {
       await options.onProgress?.({
         type: "tool_status",
         tool: toolCall.name,
-        phase: toolCall.name === "web_search" ? "search" : toolCall.name === "web_fetch" ? "fetch" : "tool",
+        phase: toolCall.name === "web_search"
+          ? "search"
+          : toolCall.name === "web_fetch"
+            ? "fetch"
+            : "tool",
         title: toolProgressTitle(toolCall.name),
-        query: toolCall.name === "web_search" ? readToolArg(toolCall.arguments, "query") : undefined,
+        query: toolCall.name === "web_search"
+          ? readToolArg(toolCall.arguments, "query")
+          : toolCall.name === "worker_dispatch_task"
+            ? readToolArg(toolCall.arguments, "goal")
+            : undefined,
         url: toolCall.name === "web_fetch" ? readToolArg(toolCall.arguments, "url") : undefined
       });
-      const observation = await executeAgentTool(toolCall, options.store, fetchImpl);
+      const observation = await executeAgentTool(toolCall, options.store, fetchImpl, options);
       await options.onProgress?.({
         type: "tool_result",
         tool: toolCall.name,
         summary: summarizeObservation(toolCall.name, observation)
       });
-      transcript = appendToolOutput(provider.adapterType, transcript, toolCall, observation);
+      toolResults.push({ toolCall, observation });
     }
+    transcript = appendToolOutputs(provider.adapterType, transcript, toolResults);
   }
 }
 
@@ -250,6 +287,9 @@ function toolProgressTitle(toolName: string): string {
   }
   if (toolName === "memory_search") {
     return "Searching memories";
+  }
+  if (toolName === "worker_dispatch_task") {
+    return "Dispatching worker task";
   }
   return `Running ${toolName}`;
 }
@@ -270,6 +310,30 @@ function resolveChatRoute(store: MemoryStore): { route: LlmModelRoute; provider:
 }
 
 async function callModelWithTools(
+  provider: LlmProviderConfigSecret,
+  route: Pick<LlmModelRoute, "model" | "temperature" | "maxTokens">,
+  transcript: unknown[],
+  tools: FunctionToolDefinition[],
+  fetchImpl: typeof fetch,
+  onDelta?: (delta: string) => void | Promise<void>
+): Promise<ModelTurnResult> {
+  if (onDelta && provider.adapterType === "openai-compatible") {
+    return streamOpenAiCompatibleWithTools(provider, route, transcript, tools, fetchImpl, onDelta);
+  }
+  if (onDelta && provider.adapterType === "anthropic") {
+    return streamAnthropicWithTools(provider, route, transcript, tools, fetchImpl, onDelta);
+  }
+
+  const response = await callModelWithToolsNonStreaming(provider, route, transcript, tools, fetchImpl);
+  const toolCalls = extractToolCalls(provider.adapterType, response);
+  return {
+    response,
+    toolCalls,
+    text: toolCalls.length === 0 ? extractAssistantText(provider.adapterType, response) : ""
+  };
+}
+
+async function callModelWithToolsNonStreaming(
   provider: LlmProviderConfigSecret,
   route: Pick<LlmModelRoute, "model" | "temperature" | "maxTokens">,
   transcript: unknown[],
@@ -331,6 +395,191 @@ async function callModelWithTools(
     })
   });
   return readJsonResponse(response);
+}
+
+async function streamOpenAiCompatibleWithTools(
+  provider: LlmProviderConfigSecret,
+  route: Pick<LlmModelRoute, "model" | "temperature" | "maxTokens">,
+  transcript: unknown[],
+  tools: FunctionToolDefinition[],
+  fetchImpl: typeof fetch,
+  onDelta: (delta: string) => void | Promise<void>
+): Promise<ModelTurnResult> {
+  const response = await fetchImpl(`${trimBaseUrl(provider.baseUrl ?? "https://api.openai.com/v1")}/chat/completions`, {
+    method: "POST",
+    headers: authHeaders(provider.apiKey),
+    body: JSON.stringify({
+      model: route.model,
+      messages: transcript,
+      tools: tools.map((tool) => ({
+        type: "function",
+        function: {
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.parameters
+        }
+      })),
+      temperature: route.temperature,
+      max_tokens: route.maxTokens,
+      stream: true
+    })
+  });
+
+  let fullText = "";
+  const toolAcc = new Map<number, ParsedToolCall>();
+  let sawToolCalls = false;
+
+  await readSseStream(response, async (event) => {
+    const choice = (event as { choices?: Array<{ delta?: Record<string, unknown> }> }).choices?.[0];
+    const delta = choice?.delta;
+    if (!delta) {
+      return "";
+    }
+    if (typeof delta.content === "string" && delta.content.length > 0 && !sawToolCalls) {
+      fullText += delta.content;
+      await onDelta(delta.content);
+      return delta.content;
+    }
+    const toolCalls = delta.tool_calls;
+    if (Array.isArray(toolCalls)) {
+      sawToolCalls = true;
+      for (const toolCall of toolCalls) {
+        const item = toolCall as {
+          index?: number;
+          id?: string;
+          function?: { name?: string; arguments?: string };
+        };
+        const index = item.index ?? 0;
+        const current = toolAcc.get(index) ?? { id: "", name: "", arguments: "" };
+        if (item.id) {
+          current.id = item.id;
+        }
+        if (item.function?.name) {
+          current.name = item.function.name;
+        }
+        if (item.function?.arguments) {
+          current.arguments += item.function.arguments;
+        }
+        toolAcc.set(index, current);
+      }
+    }
+    return "";
+  });
+
+  const toolCalls = Array.from(toolAcc.values()).filter((item) => item.id && item.name);
+  const assistantMessage = {
+    role: "assistant",
+    content: fullText.length > 0 ? fullText : null,
+    ...(toolCalls.length > 0
+      ? {
+          tool_calls: toolCalls.map((toolCall) => ({
+            id: toolCall.id,
+            type: "function",
+            function: {
+              name: toolCall.name,
+              arguments: toolCall.arguments
+            }
+          }))
+        }
+      : {})
+  };
+
+  return {
+    text: fullText,
+    toolCalls,
+    response: { choices: [{ message: assistantMessage }] }
+  };
+}
+
+async function streamAnthropicWithTools(
+  provider: LlmProviderConfigSecret,
+  route: Pick<LlmModelRoute, "model" | "temperature" | "maxTokens">,
+  transcript: unknown[],
+  tools: FunctionToolDefinition[],
+  fetchImpl: typeof fetch,
+  onDelta: (delta: string) => void | Promise<void>
+): Promise<ModelTurnResult> {
+  const anthropicRequest = buildAnthropicToolRequest(transcript);
+  const response = await fetchImpl(`${trimBaseUrl(provider.baseUrl ?? "https://api.anthropic.com/v1")}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": provider.apiKey ?? "",
+      "anthropic-version": "2023-06-01"
+    },
+    body: JSON.stringify({
+      model: route.model,
+      system: anthropicRequest.system,
+      messages: anthropicRequest.messages,
+      tools: toAnthropicTools(tools),
+      temperature: route.temperature,
+      max_tokens: route.maxTokens,
+      stream: true
+    })
+  });
+
+  let fullText = "";
+  const contentBlocks: Array<Record<string, unknown>> = [];
+  let currentBlock: { type: string; id?: string; name?: string; text?: string; inputJson?: string } | null = null;
+  let sawToolUse = false;
+
+  await readSseStream(response, async (event) => {
+    const type = typeof event.type === "string" ? event.type : "";
+    if (type === "content_block_start") {
+      const block = event.content_block as { type?: string; id?: string; name?: string } | undefined;
+      if (block?.type === "text") {
+        currentBlock = { type: "text", text: "" };
+      } else if (block?.type === "tool_use") {
+        sawToolUse = true;
+        currentBlock = { type: "tool_use", id: block.id, name: block.name, inputJson: "" };
+      }
+      return "";
+    }
+    if (type === "content_block_delta") {
+      const delta = event.delta as { type?: string; text?: string; partial_json?: string } | undefined;
+      if (delta?.type === "text_delta" && typeof delta.text === "string" && currentBlock?.type === "text") {
+        currentBlock.text = `${currentBlock.text ?? ""}${delta.text}`;
+        if (!sawToolUse) {
+          fullText += delta.text;
+          await onDelta(delta.text);
+        }
+        return delta.text;
+      }
+      if (delta?.type === "input_json_delta" && currentBlock?.type === "tool_use") {
+        currentBlock.inputJson = `${currentBlock.inputJson ?? ""}${delta.partial_json ?? ""}`;
+      }
+      return "";
+    }
+    if (type === "content_block_stop" && currentBlock) {
+      if (currentBlock.type === "text") {
+        contentBlocks.push({ type: "text", text: currentBlock.text ?? "" });
+      } else if (currentBlock.type === "tool_use") {
+        contentBlocks.push({
+          type: "tool_use",
+          id: currentBlock.id,
+          name: currentBlock.name,
+          input: parseToolArguments(currentBlock.inputJson ?? "{}")
+        });
+      }
+      currentBlock = null;
+    }
+    return "";
+  });
+
+  const toolCalls = contentBlocks
+    .filter((block) => block.type === "tool_use")
+    .map((block) => ({
+      id: String(block.id ?? ""),
+      name: String(block.name ?? ""),
+      arguments: JSON.stringify(block.input ?? {})
+    }))
+    .filter((item) => item.id && item.name);
+
+  return {
+    text: fullText,
+    toolCalls,
+    response: { content: contentBlocks }
+  };
 }
 
 interface ParsedToolCall {
@@ -440,6 +689,31 @@ function appendToolRound(
   return [...transcript, message];
 }
 
+function appendToolOutputs(
+  adapterType: LlmProviderConfigSecret["adapterType"],
+  transcript: unknown[],
+  results: Array<{ toolCall: ParsedToolCall; observation: Record<string, unknown> }>
+): unknown[] {
+  if (results.length === 0) {
+    return transcript;
+  }
+  if (adapterType === "anthropic") {
+    return [...transcript, {
+      role: "user",
+      content: results.map(({ toolCall, observation }) => ({
+        type: "tool_result",
+        tool_use_id: toolCall.id,
+        content: JSON.stringify(observation)
+      }))
+    }];
+  }
+  let next = transcript;
+  for (const { toolCall, observation } of results) {
+    next = appendToolOutput(adapterType, next, toolCall, observation);
+  }
+  return next;
+}
+
 function appendToolOutput(
   adapterType: LlmProviderConfigSecret["adapterType"],
   transcript: unknown[],
@@ -485,7 +759,8 @@ function appendToolOutput(
 async function executeAgentTool(
   toolCall: ParsedToolCall,
   store: MemoryStore,
-  fetchImpl: typeof fetch
+  fetchImpl: typeof fetch,
+  options?: Pick<ChatToolLoopOptions, "onProgress">
 ): Promise<Record<string, unknown>> {
   const args = parseToolArguments(toolCall.arguments);
   if (toolCall.name === "owner_profile_read") {
@@ -513,6 +788,20 @@ async function executeAgentTool(
       url: args.url,
       max_chars: args.max_chars
     }, fetchImpl);
+  }
+  if (toolCall.name === "worker_dispatch_task") {
+    return executeWorkerDispatchTask(store, args, {
+      onProgress: async (event) => {
+        await options?.onProgress?.({
+          type: "tool_status",
+          tool: event.tool,
+          phase: event.phase,
+          title: event.title,
+          query: event.query,
+          url: event.url
+        });
+      }
+    });
   }
 
   const registryTool = store.listToolRegistryEntries().find((tool) => tool.enabled && tool.name === toolCall.name);
@@ -568,6 +857,9 @@ function summarizeObservation(toolName: string, observation: Record<string, unkn
   if (toolName === "memory_search") {
     const count = Array.isArray(observation.memories) ? observation.memories.length : 0;
     return `${count} memor${count === 1 ? "y" : "ies"}`;
+  }
+  if (toolName === "worker_dispatch_task") {
+    return summarizeWorkerDispatchTask(observation);
   }
   if (typeof observation.text === "string" && observation.text.length > 0) {
     return `${observation.text.length} characters returned`;

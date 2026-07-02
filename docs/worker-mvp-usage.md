@@ -6,22 +6,30 @@ Workers are not independent brains. They do not write the canonical graph databa
 
 ## Current Capabilities
 
-The Worker MVP supports only read-only capabilities:
+The Worker MVP exposes only two capabilities to Brain:
 
 - `worker.status`: report worker identity, status, host, OS, capabilities, and recent jobs.
-- `file.list`: list file and directory metadata directly under an allowed directory. It does not read file contents.
-- `file.search`: search file names and metadata inside allowed paths. It does not read file contents.
-- `file.read`: read one allowed file with a maximum byte limit.
+- `agent.execute`: accept a natural-language task and run a local Worker Agent on the worker device.
+
+`file.list`, `file.search`, `file.read`, `file.write`, and `command_run` are not standalone Brain-visible capabilities. They exist only inside the Worker Agent runtime behind `agent.execute`.
+
+Inside `agent.execute`, the Worker Agent can:
+
+- list directories
+- search file names
+- read text files
+- create or update text files
+- run shell commands
+
+These operations are bounded by the worker runtime policy: allowed paths, sensitive path blocking, byte/output limits, and job timeouts.
 
 The first MVP intentionally does not support:
 
-- `file.write`
-- `command.run`
 - email sending
 - browser or app control
 - external publishing
 - payment, account, or production operations
-- autonomous high-risk execution
+- autonomous high-risk external execution
 
 ## Start Brain And Web
 
@@ -58,7 +66,7 @@ curl -s -X POST http://127.0.0.1:8787/api/workers/pair-codes \
   -d '{"ttl_ms":600000}'
 ```
 
-Then pair the worker. Choose the local folders this worker is allowed to read. The worker and Brain both enforce the allowlist.
+Then pair the worker. Choose the local folders this worker runtime may access.
 
 ```bash
 SEDNA_BRAIN_URL=http://127.0.0.1:8787 \
@@ -83,13 +91,16 @@ Pairing saves `worker_id` and this worker's own credential in ignored local stat
 | --- | --- | --- |
 | `SEDNA_BRAIN_URL` | yes | Brain API base URL, for example `http://127.0.0.1:8787`. |
 | `SEDNA_WORKER_NAME` | no | Display name shown in the Web UI. |
-| `SEDNA_WORKER_ALLOWED_PATHS` | yes for file capabilities | Path-delimited list of folders the worker may read. |
+| `SEDNA_WORKER_ALLOWED_PATHS` | strongly recommended | Path-delimited list of folders the Worker Agent may access. If empty, the runtime falls back to the home directory for searches and does not restrict local paths beyond forbidden-path checks. |
 | `SEDNA_WORKER_STATE_PATH` | no | Local ignored state file containing the worker id. Defaults to `apps/worker/.local/worker-state.json`. |
 | `SEDNA_WORKER_HEARTBEAT_MS` | no | Heartbeat interval. Defaults to `10000`. |
 | `SEDNA_WORKER_POLL_MS` | no | Pending job polling interval. Defaults to `2000`. |
-| `SEDNA_WORKER_MAX_READ_BYTES` | no | Default maximum bytes for `file.read`. |
-| `SEDNA_WORKER_MAX_SEARCH_RESULTS` | no | Default maximum results for `file.search`. |
-| `SEDNA_WORKER_MAX_LIST_ENTRIES` | no | Default maximum entries for `file.list`. |
+| `SEDNA_WORKER_MAX_READ_BYTES` | no | Default max bytes for internal Worker Agent `file_read`. |
+| `SEDNA_WORKER_MAX_WRITE_BYTES` | no | Default max bytes for internal Worker Agent `file_write`. |
+| `SEDNA_WORKER_MAX_SEARCH_RESULTS` | no | Default max results for internal Worker Agent `file_search`. |
+| `SEDNA_WORKER_MAX_LIST_ENTRIES` | no | Default max entries for internal Worker Agent `file_list`. |
+| `SEDNA_WORKER_MAX_COMMAND_MS` | no | Default max runtime for internal Worker Agent `command_run`. |
+| `SEDNA_WORKER_MAX_COMMAND_OUTPUT_BYTES` | no | Default max captured output for internal Worker Agent `command_run`. |
 
 Do not commit `.env`, worker state files, local databases, private paths, or credentials.
 
@@ -138,7 +149,7 @@ The page shows:
 - host and OS
 - last heartbeat
 - declared capabilities
-- allowed read-only paths
+- configured path scopes
 - recent jobs and job results
 - revoke action
 
@@ -164,35 +175,30 @@ Revoked workers are hidden from the active worker list but remain in Brain for a
 
 ## Use Worker From Chat
 
-When at least one worker is online, Brain can use the worker for basic read-only local file actions from the chat flow.
-
-Supported chat-triggered actions:
-
-- listing a local directory through `file.list`
-- local file name search through `file.search`
-- reading an explicit local file path through `file.read`
+When at least one worker is online and Brain Agent mode is available, Brain dispatches `agent.execute` jobs through `worker_dispatch_task`.
 
 Example prompts:
 
 ```text
 Search my local files for README.
-Find package.json in the local project.
 List /Users/example/Projects/my-project.
 Read /Users/example/Projects/my-project/README.md.
+Update /Users/example/Projects/my-project/notes.md with a short summary.
+Run npm test in /Users/example/Projects/my-project and summarize the failures.
 ```
 
 Brain will:
 
 1. choose an online worker
-2. check the worker capability and allowed read-only path scopes
-3. create a worker job
-4. wait briefly for the worker result
-5. pass the worker observation into the assistant reply context
+2. check that `agent.execute` is enabled
+3. create an `agent.execute` worker job
+4. let the Worker Agent decide how to use local files or shell commands
+5. use the worker `answer` / `steps` as tool observations for the final reply
 6. write worker job events and audit records
 
-If no worker is online, no worker action is executed. If the worker job fails or times out, the assistant reply still proceeds without treating the worker result as trusted context.
+If no worker is online, Brain must not invent local file results.
 
-## Create A Read-Only Job Manually
+## Create A Job Manually
 
 You can also drive the Worker MVP directly through Brain API for debugging.
 
@@ -202,52 +208,19 @@ List workers:
 curl -s http://127.0.0.1:8787/api/workers
 ```
 
-Create a `file.list` job:
+Create an `agent.execute` job:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8787/api/worker-jobs \
   -H 'Content-Type: application/json' \
   -d '{
     "worker_id": "worker_xxx",
-    "capability": "file.list",
+    "capability": "agent.execute",
     "input": {
-      "path": "/absolute/allowed/path",
-      "max_entries": 100
+      "goal": "List direct children under /absolute/allowed/path",
+      "context": "Owner asked from chat"
     },
-    "timeout_ms": 30000
-  }'
-```
-
-Create a `file.search` job:
-
-```bash
-curl -s -X POST http://127.0.0.1:8787/api/worker-jobs \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "worker_id": "worker_xxx",
-    "capability": "file.search",
-    "input": {
-      "query": "README",
-      "paths": ["/absolute/allowed/path"],
-      "max_results": 20
-    },
-    "timeout_ms": 30000
-  }'
-```
-
-Create a `file.read` job:
-
-```bash
-curl -s -X POST http://127.0.0.1:8787/api/worker-jobs \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "worker_id": "worker_xxx",
-    "capability": "file.read",
-    "input": {
-      "path": "/absolute/allowed/path/README.md",
-      "max_bytes": 200000
-    },
-    "timeout_ms": 30000
+    "timeout_ms": 120000
   }'
 ```
 
@@ -259,12 +232,14 @@ curl -s http://127.0.0.1:8787/api/workers/worker_xxx
 
 ## Safety Rules
 
-Worker file capabilities are intentionally narrow:
+Worker execution is intentionally scoped:
 
-- File access must stay inside enabled read-only worker path scopes.
-- `file.search` returns file metadata only and does not read file contents.
-- `file.list` returns direct child metadata only and does not read file contents.
-- `file.read` is limited by `max_bytes` and may truncate large files.
+- Brain dispatches only `agent.execute`; local file and command tools are internal to the Worker Agent.
+- The worker runtime enforces `SEDNA_WORKER_ALLOWED_PATHS` when it is configured.
+- Brain stores and displays worker path scopes for owner policy management; the current runtime policy is still driven by the worker environment variables.
+- File writes are text-only and capped by `SEDNA_WORKER_MAX_WRITE_BYTES`.
+- Shell command execution is capped by timeout and output limits.
+- `agent.execute` is bounded by job timeout and returns `answer`, `steps`, and errors.
 - Jobs must use declared capabilities.
 - Jobs have timeouts.
 - Job lifecycle changes write events and audit records.
@@ -291,11 +266,12 @@ If the worker does not appear in the UI, check:
 - The worker can reach the Brain API.
 - `SEDNA_WORKER_ALLOWED_PATHS` points to existing absolute paths.
 
-If a file job is rejected, check:
+If a worker task fails, check:
 
 - The requested path is inside one of the allowed paths.
 - The path is not a forbidden secret/runtime/build path.
-- The capability name is exactly `file.search` or `file.read`.
+- Brain chat LLM is configured in Settings.
+- The worker has `agent.execute` enabled.
 - The worker is online and polling jobs.
 
 If you need to re-register a local development worker, remove the ignored local worker state file configured by `SEDNA_WORKER_STATE_PATH`, or the default `apps/worker/.local/worker-state.json`, and restart the worker.

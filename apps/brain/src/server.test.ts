@@ -445,7 +445,7 @@ describe("Brain API", () => {
         os: "test-os",
         capabilities: [
           { name: "worker.status", risk: "low", read_only: true, requires_confirmation: false, allowed_scopes: ["self"] },
-          { name: "file.search", risk: "low", read_only: true, requires_confirmation: false, allowed_scopes: ["approved_paths"] }
+          { name: "agent.execute", risk: "medium", read_only: true, requires_confirmation: false, allowed_scopes: ["approved_paths"] }
         ],
         path_scopes: [
           { label: "Temp", path: "/tmp/sedna-worker", mode: "read_only" }
@@ -472,8 +472,8 @@ describe("Brain API", () => {
       url: "/api/worker-jobs",
       payload: {
         worker_id: worker.id,
-        capability: "file.search",
-        input: { query: "README", paths: ["/tmp/sedna-worker"], max_results: 10 }
+        capability: "agent.execute",
+        input: { goal: "Search for README under /tmp/sedna-worker" }
       }
     });
     expect(job.statusCode).toBe(201);
@@ -489,13 +489,13 @@ describe("Brain API", () => {
       method: "POST",
       url: `/api/workers/${worker.id}/jobs/${job.json().id}/complete`,
       headers: auth,
-      payload: { result: { matches: [] } }
+      payload: { result: { success: true, answer: "No README matches found.", steps: [] } }
     });
     expect(completed.json().status).toBe("completed");
 
     const detail = await app.inject({ method: "GET", url: `/api/workers/${worker.id}` });
     expect(detail.statusCode).toBe(200);
-    expect(detail.json().capabilities.map((capability: { name: string }) => capability.name)).toEqual(["file.search", "worker.status"]);
+    expect(detail.json().capabilities.map((capability: { name: string }) => capability.name)).toEqual(["agent.execute", "worker.status"]);
     expect(detail.json().recentJobs[0].status).toBe("completed");
     expect(store.listEvents().map((event) => event.type)).toEqual(expect.arrayContaining([
       "worker.registered",
@@ -623,7 +623,7 @@ describe("Brain API", () => {
         display_name: "Policy worker",
         environment_type: "local",
         capabilities: [
-          { name: "file.read", risk: "medium", read_only: true, requires_confirmation: false, allowed_scopes: ["approved_paths"] }
+          { name: "agent.execute", risk: "medium", read_only: true, requires_confirmation: false, allowed_scopes: ["approved_paths"] }
         ],
         path_scopes: [{ label: "Workspace", path: "/tmp/sedna-worker", mode: "read_only" }]
       }
@@ -649,7 +649,7 @@ describe("Brain API", () => {
       url: `/api/workers/${worker.id}/capabilities`,
       headers: auth,
       payload: {
-        name: "file.read",
+        name: "agent.execute",
         risk: "low",
         read_only: true,
         requires_confirmation: false,

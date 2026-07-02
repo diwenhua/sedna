@@ -167,8 +167,8 @@ describe("memory store", () => {
           allowedScopes: ["self"]
         },
         {
-          name: "file.search",
-          risk: "low",
+          name: "agent.execute",
+          risk: "medium",
           readOnly: true,
           requiresConfirmation: false,
           allowedScopes: ["approved_paths"]
@@ -180,7 +180,7 @@ describe("memory store", () => {
     });
 
     expect(worker.status).toBe("online");
-    expect(store.listWorkerCapabilities(worker.id).map((capability) => capability.name)).toEqual(["file.search", "worker.status"]);
+    expect(store.listWorkerCapabilities(worker.id).map((capability) => capability.name)).toEqual(["agent.execute", "worker.status"]);
     expect(store.listWorkerPathScopes(worker.id)[0]?.path).toBe("/tmp/sedna-worker");
 
     const heartbeat = store.heartbeatWorker(worker.id, { pid: 123 });
@@ -188,29 +188,17 @@ describe("memory store", () => {
 
     const job = store.createWorkerJob({
       workerId: worker.id,
-      capability: "file.search",
-      input: { query: "README", paths: ["/tmp/sedna-worker"], max_results: 10 }
+      capability: "agent.execute",
+      input: { goal: "List files under /tmp/sedna-worker" }
     });
     expect(store.listWorkerJobs({ workerId: worker.id, status: "queued" })).toHaveLength(1);
 
     expect(store.startWorkerJob(worker.id, job.id).status).toBe("running");
-    expect(store.completeWorkerJob(worker.id, job.id, { matches: [] }).status).toBe("completed");
-    store.upsertWorkerCapability(worker.id, {
-      name: "file.list",
-      risk: "low",
-      readOnly: true,
-      requiresConfirmation: false,
-      enabled: true,
-      allowedScopes: ["approved_paths"]
-    });
-    expect(store.createWorkerJob({
-      workerId: worker.id,
-      capability: "file.list",
-      input: { path: "/tmp/sedna-worker", max_entries: 20 }
-    })).toMatchObject({
-      capability: "file.list",
-      status: "queued"
-    });
+    expect(store.completeWorkerJob(worker.id, job.id, {
+      success: true,
+      answer: "README.md is present.",
+      steps: [{ tool: "file_list", summary: "1 entry" }]
+    }).status).toBe("completed");
     expect(store.listEvents().map((event) => event.type)).toEqual(expect.arrayContaining([
       "worker.registered",
       "worker.heartbeat",
@@ -226,7 +214,7 @@ describe("memory store", () => {
     ]));
   });
 
-  it("rejects worker jobs outside allowed scopes or inside forbidden paths", () => {
+  it("rejects agent.execute jobs without a goal", () => {
     const store = createMemoryStore(":memory:");
     store.migrate();
     const worker = store.registerWorker({
@@ -234,7 +222,7 @@ describe("memory store", () => {
       environment: "local",
       capabilities: [
         {
-          name: "file.read",
+          name: "agent.execute",
           risk: "medium",
           readOnly: true,
           requiresConfirmation: false,
@@ -248,14 +236,36 @@ describe("memory store", () => {
 
     expect(() => store.createWorkerJob({
       workerId: worker.id,
-      capability: "file.read",
-      input: { path: "/tmp/other/file.txt" }
-    })).toThrow("outside allowed scopes");
-    expect(() => store.createWorkerJob({
+      capability: "agent.execute",
+      input: { context: "missing goal" }
+    })).toThrow("requires goal");
+  });
+
+  it("accepts agent.execute jobs when the capability is mutating", () => {
+    const store = createMemoryStore(":memory:");
+    store.migrate();
+    const worker = store.registerWorker({
+      displayName: "Local worker",
+      environment: "local",
+      capabilities: [
+        {
+          name: "agent.execute",
+          risk: "high",
+          readOnly: false,
+          requiresConfirmation: false,
+          allowedScopes: ["self"]
+        }
+      ]
+    });
+
+    const job = store.createWorkerJob({
       workerId: worker.id,
-      capability: "file.read",
-      input: { path: "/tmp/sedna-worker/.env" }
-    })).toThrow("forbidden");
+      capability: "agent.execute",
+      input: { goal: "Create /tmp/sedna-demo.txt with hello" }
+    });
+
+    expect(job.capability).toBe("agent.execute");
+    expect(job.input.goal).toBe("Create /tmp/sedna-demo.txt with hello");
   });
 
   it("preserves owner capability policy when worker re-declares capabilities", () => {
@@ -266,7 +276,7 @@ describe("memory store", () => {
       environment: "local",
       capabilities: [
         {
-          name: "file.read",
+          name: "agent.execute",
           risk: "medium",
           readOnly: true,
           requiresConfirmation: false,
@@ -283,7 +293,7 @@ describe("memory store", () => {
     });
 
     store.declareWorkerCapability(worker.id, {
-      name: "file.read",
+      name: "agent.execute",
       risk: "low",
       readOnly: true,
       requiresConfirmation: false,
@@ -295,6 +305,57 @@ describe("memory store", () => {
     expect(capability.enabled).toBe(false);
     expect(capability.requiresConfirmation).toBe(true);
     expect(capability.risk).toBe("high");
+  });
+
+  it("removes undeclared worker capabilities during capability sync", () => {
+    const store = createMemoryStore(":memory:");
+    store.migrate();
+    const worker = store.registerWorker({
+      displayName: "Local worker",
+      environment: "local",
+      capabilities: [
+        {
+          name: "file.list",
+          risk: "low",
+          readOnly: true,
+          requiresConfirmation: false,
+          enabled: true,
+          allowedScopes: ["approved_paths"]
+        },
+        {
+          name: "worker.status",
+          risk: "low",
+          readOnly: true,
+          requiresConfirmation: false,
+          enabled: true,
+          allowedScopes: ["self"]
+        }
+      ]
+    });
+
+    store.syncWorkerCapabilities(worker.id, [
+      {
+        name: "worker.status",
+        risk: "low",
+        readOnly: true,
+        requiresConfirmation: false,
+        enabled: true,
+        allowedScopes: ["self"]
+      },
+      {
+        name: "agent.execute",
+        risk: "medium",
+        readOnly: true,
+        requiresConfirmation: false,
+        enabled: true,
+        allowedScopes: ["approved_paths"]
+      }
+    ]);
+
+    expect(store.listWorkerCapabilities(worker.id).map((capability) => capability.name)).toEqual([
+      "agent.execute",
+      "worker.status"
+    ]);
   });
 
   it("updates and deletes worker path scopes from owner policy", () => {
@@ -324,7 +385,7 @@ describe("memory store", () => {
       environment: "local",
       capabilities: [
         {
-          name: "file.read",
+          name: "agent.execute",
           risk: "medium",
           readOnly: true,
           requiresConfirmation: false,

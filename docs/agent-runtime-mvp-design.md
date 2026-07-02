@@ -167,6 +167,8 @@ First-version blocked external tools:
 - payment or account operations
 - uncontrolled worker execution
 
+Brain should not expose raw `command.run` or `file.write` as first-class Brain tools in the MVP. Local file mutation and shell commands may happen only inside a policy-scoped Worker Agent job (`agent.execute`), with path limits, timeouts, output limits, worker credentials, job events, and audit records.
+
 ## Policy
 
 Default policy:

@@ -6,22 +6,30 @@ Worker 不是独立大脑。它不能直接写规范记忆图数据库，不拥�
 
 ## 当前能力
 
-Worker MVP 只支持只读能力：
+Worker MVP 对 Brain 只暴露两个 capability：
 
 - `worker.status`：上报 worker 身份、状态、主机、系统、能力和最近任务。
-- `file.list`：列出允许目录下的直接子文件/子目录元数据，不读取文件内容。
-- `file.search`：在允许路径内搜索文件名和元数据，不读取文件内容。
-- `file.read`：读取一个允许路径内的文件，并受最大字节数限制。
+- `agent.execute`：接收自然语言任务，在 worker 设备上运行本地 Worker Agent。
+
+`file.list` / `file.search` / `file.read` / `file.write` / `command_run` 不是 Brain 可见的独立 capability，只作为 `agent.execute` 背后的 Worker Agent 内部工具存在。
+
+在 `agent.execute` 内部，Worker Agent 可以：
+
+- 列目录
+- 搜索文件名
+- 读取文本文件
+- 创建或更新文本文件
+- 执行 shell 命令
+
+这些操作会受到 worker runtime policy 限制：允许路径、敏感路径阻断、读写/输出大小上限和 job timeout。
 
 第一版明确不支持：
 
-- `file.write`
-- `command.run`
 - 邮件发送
 - 浏览器或 App 控制
 - 对外发布
 - 支付、账号或生产操作
-- 自动高风险执行
+- 自动高风险外部执行
 
 ## 启动 Brain 和 Web
 
@@ -58,7 +66,7 @@ curl -s -X POST http://127.0.0.1:8787/api/workers/pair-codes \
   -d '{"ttl_ms":600000}'
 ```
 
-然后在 worker 机器上配对。先选择这个 worker 可以读取的本地目录。Worker 和 Brain 都会检查 allowlist。
+然后在 worker 机器上配对。先选择这个 worker runtime 可以访问的本地目录。
 
 ```bash
 SEDNA_BRAIN_URL=http://127.0.0.1:8787 \
@@ -83,13 +91,16 @@ macOS 和 Linux 下，`SEDNA_WORKER_ALLOWED_PATHS` 用 `:` 分隔多个路径。
 | --- | --- | --- |
 | `SEDNA_BRAIN_URL` | 是 | Brain API 地址，例如 `http://127.0.0.1:8787`。 |
 | `SEDNA_WORKER_NAME` | 否 | Web UI 中显示的 worker 名称。 |
-| `SEDNA_WORKER_ALLOWED_PATHS` | 文件能力需要 | worker 可读取目录列表，按系统路径分隔符分隔。 |
+| `SEDNA_WORKER_ALLOWED_PATHS` | 强烈建议 | Worker Agent 可访问目录列表，按系统路径分隔符分隔。如果为空，搜索默认从 home 目录开始，runtime 除 forbidden path 检查外不会限制本地路径。 |
 | `SEDNA_WORKER_STATE_PATH` | 否 | 本地忽略的 worker id 状态文件。默认是 `apps/worker/.local/worker-state.json`。 |
 | `SEDNA_WORKER_HEARTBEAT_MS` | 否 | heartbeat 间隔，默认 `10000`。 |
 | `SEDNA_WORKER_POLL_MS` | 否 | 轮询 pending job 间隔，默认 `2000`。 |
-| `SEDNA_WORKER_MAX_READ_BYTES` | 否 | `file.read` 默认最大读取字节数。 |
-| `SEDNA_WORKER_MAX_SEARCH_RESULTS` | 否 | `file.search` 默认最大结果数。 |
-| `SEDNA_WORKER_MAX_LIST_ENTRIES` | 否 | `file.list` 默认最大条目数。 |
+| `SEDNA_WORKER_MAX_READ_BYTES` | 否 | Worker Agent 内部 `file_read` 默认最大读取字节数。 |
+| `SEDNA_WORKER_MAX_WRITE_BYTES` | 否 | Worker Agent 内部 `file_write` 默认最大写入字节数。 |
+| `SEDNA_WORKER_MAX_SEARCH_RESULTS` | 否 | Worker Agent 内部 `file_search` 默认最大结果数。 |
+| `SEDNA_WORKER_MAX_LIST_ENTRIES` | 否 | Worker Agent 内部 `file_list` 默认最大条目数。 |
+| `SEDNA_WORKER_MAX_COMMAND_MS` | 否 | Worker Agent 内部 `command_run` 默认最大执行时长。 |
+| `SEDNA_WORKER_MAX_COMMAND_OUTPUT_BYTES` | 否 | Worker Agent 内部 `command_run` 默认最大输出捕获字节数。 |
 
 不要提交 `.env`、worker state、本地数据库、私有路径或凭据。
 
@@ -138,7 +149,7 @@ http://127.0.0.1:5173/workers
 - 主机和系统
 - 最近 heartbeat
 - 已声明能力
-- 允许读取的路径
+- 已配置 path scopes
 - 最近任务和任务结果
 - 解除关联按钮
 
@@ -164,35 +175,30 @@ pnpm dev:worker unpair
 
 ## 在对话中使用 Worker
 
-当至少有一个 worker 在线时，Brain 可以在聊天流程中调用 worker 执行基础只读本地文件动作。
-
-当前支持从对话触发：
-
-- 通过 `file.list` 列出本地目录
-- 通过 `file.search` 搜索本地文件名
-- 通过 `file.read` 读取明确给出的本地文件路径
+当至少有一个 worker 在线且 Brain Agent 可用时，Brain 通过 `worker_dispatch_task` 向 Worker 下发 `agent.execute` job。
 
 示例：
 
 ```text
 帮我在本地搜索 README
-在本地项目里找 package.json
 列出 /Users/example/Projects/my-project 下面有哪些文件
 读取 /Users/example/Projects/my-project/README.md
+把 /Users/example/Projects/my-project/notes.md 更新成一个简短总结
+在 /Users/example/Projects/my-project 里运行 npm test 并总结失败原因
 ```
 
 Brain 会：
 
 1. 选择一个在线 worker
-2. 检查 worker capability 和只读 allowed path scope
-3. 创建 worker job
-4. 短时间等待 worker 返回结果
-5. 把 worker observation 放入 assistant reply context
+2. 检查 worker 是否启用 `agent.execute`
+3. 创建 `agent.execute` worker job
+4. Worker 本地 Agent 自行决定如何使用本地文件或 shell 命令
+5. 把 worker 返回的 `answer` / `steps` 作为 tool observation 供 Brain 总结
 6. 写入 worker job events 和 audit records
 
-如果没有 worker 在线，就不会执行 worker action。如果 worker job 失败或超时，assistant reply 仍会继续生成，但不会把失败结果当作可信上下文。
+如果没有 worker 在线，Brain 不会编造本地文件结果。
 
-## 手动创建只读任务
+## 手动创建任务
 
 你也可以直接通过 Brain API 派发 worker job，便于调试 Worker 基础链路。
 
@@ -202,52 +208,19 @@ Brain 会：
 curl -s http://127.0.0.1:8787/api/workers
 ```
 
-创建 `file.list` 任务：
+创建 `agent.execute` 任务：
 
 ```bash
 curl -s -X POST http://127.0.0.1:8787/api/worker-jobs \
   -H 'Content-Type: application/json' \
   -d '{
     "worker_id": "worker_xxx",
-    "capability": "file.list",
+    "capability": "agent.execute",
     "input": {
-      "path": "/absolute/allowed/path",
-      "max_entries": 100
+      "goal": "列出 /absolute/allowed/path 下的直接子文件和目录",
+      "context": "Owner asked from chat"
     },
-    "timeout_ms": 30000
-  }'
-```
-
-创建 `file.search` 任务：
-
-```bash
-curl -s -X POST http://127.0.0.1:8787/api/worker-jobs \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "worker_id": "worker_xxx",
-    "capability": "file.search",
-    "input": {
-      "query": "README",
-      "paths": ["/absolute/allowed/path"],
-      "max_results": 20
-    },
-    "timeout_ms": 30000
-  }'
-```
-
-创建 `file.read` 任务：
-
-```bash
-curl -s -X POST http://127.0.0.1:8787/api/worker-jobs \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "worker_id": "worker_xxx",
-    "capability": "file.read",
-    "input": {
-      "path": "/absolute/allowed/path/README.md",
-      "max_bytes": 200000
-    },
-    "timeout_ms": 30000
+    "timeout_ms": 120000
   }'
 ```
 
@@ -259,12 +232,14 @@ curl -s http://127.0.0.1:8787/api/workers/worker_xxx
 
 ## 安全规则
 
-Worker 文件能力刻意保持很窄：
+Worker 执行能力刻意保持受限：
 
-- 文件访问必须在启用的只读 worker path scope 内。
-- `file.search` 只返回文件元数据，不读取内容。
-- `file.list` 只返回直接子项元数据，不读取内容。
-- `file.read` 受 `max_bytes` 限制，大文件会截断或被拒绝。
+- Brain 只派发 `agent.execute`；本地文件和命令工具只存在于 Worker Agent 内部。
+- 配置了 `SEDNA_WORKER_ALLOWED_PATHS` 时，worker runtime 会据此限制路径访问。
+- Brain 会保存并展示 worker path scopes，方便用户管理策略；当前 runtime 实际执行策略仍由 worker 环境变量驱动。
+- 文件写入仅支持文本，并受 `SEDNA_WORKER_MAX_WRITE_BYTES` 限制。
+- Shell 命令执行受 timeout 和输出大小限制。
+- `agent.execute` 受 job timeout 限制，返回 `answer`、`steps` 和错误信息。
 - Job 必须使用 worker 已声明的能力。
 - Job 必须有 timeout。
 - Job 生命周期会写入 event 和 audit。
@@ -291,11 +266,12 @@ Worker 会拒绝敏感或噪音路径，包括：
 - worker 是否能访问 Brain API。
 - `SEDNA_WORKER_ALLOWED_PATHS` 是否是存在的绝对路径。
 
-如果文件任务被拒绝，检查：
+如果 worker 任务失败或被拒绝，检查：
 
 - 请求路径是否在 allowlist 内。
 - 请求路径是否属于被禁止的 secret/runtime/build 路径。
-- capability 名称是否正好是 `file.search` 或 `file.read`。
-- worker 是否在线并正在轮询任务。
+- Brain Settings 里已配置 chat LLM。
+- worker 已启用 `agent.execute`。
+- worker 在线并正在轮询任务。
 
 如果本地开发需要重新注册 worker，可以删除被忽略的本地 worker state 文件，也就是 `SEDNA_WORKER_STATE_PATH` 指向的文件，或默认的 `apps/worker/.local/worker-state.json`，然后重启 worker。

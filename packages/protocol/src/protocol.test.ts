@@ -119,14 +119,14 @@ describe("protocol schemas", () => {
     const job = WorkerJobSchema.parse({
       id: "job_1",
       workerId: scope.workerId,
-      capability: "file.search",
-      input: { query: "README", paths: [scope.path], max_results: 10 },
+      capability: "agent.execute",
+      input: { goal: "Read README from /Users/owner/Projects" },
       status: "queued",
       timeoutMs: 30000,
       createdAt: "2026-06-29T00:00:01.000Z"
     });
 
-    expect(job.capability).toBe("file.search");
+    expect(job.capability).toBe("agent.execute");
     expect(scope.mode).toBe("read_only");
   });
 

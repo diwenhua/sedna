@@ -55,6 +55,65 @@ describe("canUseWebToolLoop", () => {
 });
 
 describe("chat tool loop", () => {
+  it("batches anthropic tool_result blocks into one user message", async () => {
+    const store = createMemoryStore(":memory:");
+    store.migrate();
+    store.createLlmProviderConfig({
+      displayName: "Anthropic",
+      adapterType: "anthropic",
+      baseUrl: "https://api.anthropic.com/v1",
+      apiKey: "test-key",
+      defaultModel: "claude-sonnet-4-20250514",
+      enabled: true
+    });
+    const provider = store.listLlmProviderConfigs()[0]!;
+    store.updateLlmModelRoute("chat_reply", {
+      providerConfigId: provider.id,
+      model: "claude-sonnet-4-20250514",
+      temperature: 0.2,
+      maxTokens: 500,
+      enabled: true
+    });
+
+    let requestBody: { messages?: unknown[] } = {};
+    let callCount = 0;
+    const result = await runChatWithWebTools(
+      {
+        ownerMessage: "Check my profile and search memories for Sedna.",
+        recentMessages: [],
+        activeMemories: [],
+        replyLocale: "en"
+      },
+      {
+        store,
+        fetchImpl: async (_input, init) => {
+          requestBody = JSON.parse(String(init?.body ?? "{}")) as { messages?: unknown[] };
+          callCount += 1;
+          const messages = requestBody.messages ?? [];
+          const last = messages.at(-1) as { role?: string; content?: unknown } | undefined;
+          if (callCount === 1) {
+            return new Response(JSON.stringify({
+              content: [
+                { type: "tool_use", id: "call_a", name: "owner_profile_read", input: {} },
+                { type: "tool_use", id: "call_b", name: "memory_search", input: { query: "Sedna" } }
+              ]
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+          }
+          expect(last?.role).toBe("user");
+          expect(Array.isArray(last?.content)).toBe(true);
+          expect((last?.content as Array<{ tool_use_id?: string }>).map((item) => item.tool_use_id)).toEqual(["call_a", "call_b"]);
+          return new Response(JSON.stringify({
+            content: [{ type: "text", text: "Found profile and memory context." }]
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+      }
+    );
+
+    expect(result.content).toBe("Found profile and memory context.");
+    expect(callCount).toBe(2);
+    store.close();
+  });
+
   it("executes web_search and returns the final assistant reply", async () => {
     const store = createMemoryStore(":memory:");
     store.migrate();
