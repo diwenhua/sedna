@@ -33,6 +33,7 @@ The MVP includes:
 - Worker MVP registry, pair-code enrollment, policy-scoped Worker Agent jobs, and audit
 - dynamic LLM provider and model route configuration
 - MCP and Skills registry foundations
+- DingTalk and Feishu/Lark messaging channels with owner pairing, allowlists, deduplication, and audit
 
 The MVP does not include:
 
@@ -86,6 +87,7 @@ The current implementation should treat the following design documents as MVP sl
 - [Agent Workbench UI Design](agent-workbench-ui-design.md)
 - [Internationalization MVP](i18n-mvp-design.md)
 - [MCP And Skills MVP Design](mcp-and-skills-mvp-design.md)
+- [Messaging Channels MVP](message-channels-mvp.md)
 
 ## Technology Recommendation
 
@@ -128,6 +130,10 @@ Initial tables:
 - `worker_path_scopes`
 - `worker_jobs`
 - `worker_events`
+- `channel_configs`
+- `channel_pair_codes`
+- `channel_conversation_bindings`
+- `channel_messages`
 - `settings`
 
 Core graph fields:
@@ -172,6 +178,8 @@ evidence:
 `payload_json` is acceptable in the first version because the graph will evolve. Stable fields stay relational; changing domain-specific fields live in JSON until patterns settle.
 
 Owner Profile attributes are graph nodes linked by `has_attribute` edges from the `owner_profile` node. `profiles` keeps lightweight owner metadata; `profile_attribute_history` keeps change history keyed by graph node id. LLM extraction proposes profile patches; the Brain profile service decides merge, replace, conflict, review, confirmation, evidence, history, events, and audit.
+
+Memory retrieval should return a bounded, evidence-backed subgraph rather than only matching node labels. The MVP query starts from relevant active nodes, expands active relationships in either direction for at most two hops, caps the total number of returned nodes, and includes only evidence referenced by nodes or edges in that subgraph. Returned paths must preserve edge direction so the Agent can explain relationships without reversing their meaning.
 
 ## Memory Candidate Lifecycle
 
@@ -274,6 +282,11 @@ POST   /api/workers/:id/jobs/:jobId/complete
 POST   /api/workers/:id/jobs/:jobId/fail
 POST   /api/worker-jobs
 GET    /api/audit
+
+GET    /api/channels
+PATCH  /api/channels/:platform
+POST   /api/channels/:platform/pair-codes
+POST   /api/channels/:platform/reconnect
 
 GET    /api/settings
 PATCH  /api/settings

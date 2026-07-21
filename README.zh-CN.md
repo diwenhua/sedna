@@ -38,22 +38,16 @@ Sedna 的设计围绕以下核心展开：
 - **安全的分布式执行**：Worker 是受控的手，不是独立的大脑。它们在策略和审计下执行受限任务。
 - **先理解，但不只分析**：第一版应该理解用户，同时执行安全、可审计的系统内部动作。
 
-## 设计检查点
+## 文档
 
-当前产品和架构文档在这里：
+通过[中文文档地图](docs/README.zh-CN.md)查找产品、架构、子系统和运行文档。建议先读：
 
-- [docs/README.md](docs/README.md)
-- [docs/personal-agent-design-checkpoint.md](docs/personal-agent-design-checkpoint.md)
-- [docs/brain-mvp-design.md](docs/brain-mvp-design.md)
-- [docs/llm-integration-mvp.md](docs/llm-integration-mvp.md)
-- [docs/dynamic-llm-config-design.md](docs/dynamic-llm-config-design.md)
-- [docs/agent-runtime-mvp-design.md](docs/agent-runtime-mvp-design.md)
-- [docs/agent-workbench-ui-design.md](docs/agent-workbench-ui-design.md)
-- [docs/i18n-mvp-design.md](docs/i18n-mvp-design.md)
-- [docs/mcp-and-skills-mvp-design.md](docs/mcp-and-skills-mvp-design.md)
-- [docs/worker-mvp-usage.zh-CN.md](docs/worker-mvp-usage.zh-CN.md)
+- [私人 Agent 设计检查点](docs/personal-agent-design-checkpoint.md)：当前产品方向和全局架构边界
+- [Brain MVP 设计](docs/brain-mvp-design.md)：第一阶段可实现的中央大脑范围
+- [Worker MVP 使用说明](docs/worker-mvp-usage.zh-CN.md)：本地 Worker 配置和安全模型
+- [消息渠道 MVP](docs/message-channels-mvp.zh-CN.md)：钉钉及飞书/Lark 配置与渠道边界
 
-这些文档是当前设计讨论的事实来源。它们是工作检查点，不是最终实现规格。
+这些文档是持续维护的检查点，不是冻结的最终实现规格。文档地图说明了重叠文档之间的关系和维护方式。
 
 ## 预期架构
 
@@ -95,6 +89,7 @@ Web UI
 - `packages/` 下的共享 protocol、memory、policy 和工具包
 - 基于 SQLite 的规范记忆图 schema 和 migration
 - 会话时间线、候选记忆审核、图查询、worker 注册/任务 API 和审计查询 API
+- 可配置的钉钉和飞书/Lark 长连接渠道，包含 Owner 配对和消息审计
 - LLM provider 边界，面向真实 provider 配置
 - Agent Runtime 和 React Agent Workbench 是当前 MVP 设计目标
 - 动态 LLM 配置、MCP 和 Skills 是计划中的 MVP 设置能力

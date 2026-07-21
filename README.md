@@ -38,22 +38,16 @@ Sedna is designed around:
 - **Safe distributed execution**: workers are controlled hands, not independent brains. They execute scoped jobs under policy and audit.
 - **Understanding first, but not analysis-only**: the first version should learn the owner while also doing safe, auditable internal actions.
 
-## Design Checkpoint
+## Documentation
 
-The current product and architecture documents are:
+Use the [documentation map](docs/README.md) to find product, architecture, subsystem, and operating documents. The primary starting points are:
 
-- [docs/README.md](docs/README.md)
-- [docs/personal-agent-design-checkpoint.md](docs/personal-agent-design-checkpoint.md)
-- [docs/brain-mvp-design.md](docs/brain-mvp-design.md)
-- [docs/llm-integration-mvp.md](docs/llm-integration-mvp.md)
-- [docs/dynamic-llm-config-design.md](docs/dynamic-llm-config-design.md)
-- [docs/agent-runtime-mvp-design.md](docs/agent-runtime-mvp-design.md)
-- [docs/agent-workbench-ui-design.md](docs/agent-workbench-ui-design.md)
-- [docs/i18n-mvp-design.md](docs/i18n-mvp-design.md)
-- [docs/mcp-and-skills-mvp-design.md](docs/mcp-and-skills-mvp-design.md)
-- [docs/worker-mvp-usage.md](docs/worker-mvp-usage.md)
+- [Personal Agent Design Checkpoint](docs/personal-agent-design-checkpoint.md): current product direction and system-wide architectural boundaries
+- [Brain MVP Design](docs/brain-mvp-design.md): first buildable Central Brain scope
+- [Worker MVP Usage](docs/worker-mvp-usage.md): local Worker setup and safety model
+- [Messaging Channels MVP](docs/message-channels-mvp.md): DingTalk and Feishu/Lark setup and channel boundaries
 
-These documents are the current source of truth for ongoing design discussion. They are working checkpoints, not final implementation specs.
+These are working checkpoints, not frozen implementation specifications. The documentation map defines how overlapping documents relate and how they should be maintained.
 
 ## Intended Architecture
 
@@ -95,6 +89,7 @@ Current implementation slice:
 - shared protocol, memory, policy, and utility packages under `packages/`
 - SQLite-backed canonical memory graph schema and migrations
 - conversation timeline, candidate memory review, graph query, worker registry/job APIs, and audit query APIs
+- configurable DingTalk and Feishu/Lark long-connection channels with owner pairing and message audit
 - LLM provider boundary for real configured providers
 - Agent Runtime and React Agent Workbench are active MVP design targets
 - dynamic LLM configuration, MCP, and Skills are planned MVP settings surfaces

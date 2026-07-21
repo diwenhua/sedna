@@ -584,6 +584,19 @@ Typical statuses:
 
 The first version does not need a dedicated graph database, vector database, or external memory SaaS. The schema should leave room for embeddings and future migration to Postgres, pgvector, or a dedicated memory system.
 
+### Phased Graph Storage Migration
+
+Sedna should make graph behavior real before selecting or requiring a dedicated graph database. The migration path is intentionally incremental:
+
+1. isolate canonical node, edge, and evidence persistence behind a `GraphRepository` boundary while keeping SQLite as the default adapter
+2. replace flat memory lookup with scoped subgraph retrieval, relation filtering, bounded traversal, path explanations, and evidence expansion
+3. add an optional dedicated graph database adapter after the query model and operational requirements are proven
+4. migrate existing graph records with offline export/import and shadow-read verification before changing the canonical adapter
+
+The current subgraph retrieval baseline selects relevant active memory nodes, traverses active relationships in either direction for at most two hops, applies a total node cap, expands only evidence referenced by the selected subgraph, and returns direction-aware paths. Flat memory results remain available in the tool response for compatibility. Relation allowlists and lower traversal limits can be applied by callers as graph domains become richer.
+
+Conversations, settings, workers, jobs, events, and audit records may remain in SQLite even when the canonical memory graph moves to a dedicated graph database. A database change must not allow clients or workers to bypass the Brain API, policy checks, memory lifecycle, evidence requirements, or audit boundaries. Long-lived dual writes should be avoided; if two stores are used during migration, consistency and recovery must be explicit and testable.
+
 Workers may keep local storage, but only for non-authoritative runtime needs:
 
 - local cache
@@ -1028,6 +1041,26 @@ Send this file with an office computer file to a client.
 ```
 
 Local conversations should not create an independent long-term assistant personality.
+
+## Messaging Channels
+
+The owner may use a trusted messaging account as a convenient conversation entry point without exposing the Brain Web UI publicly. DingTalk and Feishu/Lark are the first implemented channel adapters.
+
+Messaging channels must remain replaceable adapters around one Brain conversation flow:
+
+- prefer vendor-supported outbound long connections over public webhook ingress
+- authenticate the platform application connection
+- bind explicit owner platform identities through short-lived, single-use pairing codes
+- reject unknown senders before LLM, memory, tools, or Worker dispatch
+- keep group access disabled by default; require an allowed group, an allowed sender, and an explicit bot mention
+- durably deduplicate vendor message IDs before processing
+- isolate conversation history by channel conversation and sender
+- record channel identity, policy decisions, resulting Brain messages, and failures in event and audit records
+- never let a messaging adapter bypass canonical memory lifecycle, Agent policy, confirmations, or Worker credentials
+
+Messaging platforms necessarily receive channel message content. Sensitive local files, credentials, private artifacts, and full memory exports should not be sent through a third-party channel by default. The Web UI remains the management and inspection surface for credentials, pairing, policy, memory, workers, and audit.
+
+See [Messaging Channels MVP](message-channels-mvp.md) for the implemented slice.
 
 Sync policy:
 
