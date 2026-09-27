@@ -35,6 +35,12 @@ import type {
   SkillDefinition,
   SkillRun,
   SkillSourceType,
+  Task,
+  TaskArtifact,
+  TaskCheckpoint,
+  TaskCheckpointKind,
+  TaskNeed,
+  TaskStatus,
   ToolRegistryEntry,
   WebSearchProvider,
   WebToolsSettings,
@@ -204,6 +210,27 @@ export interface WorkerJobInput {
   capability: string;
   input: JsonRecord;
   timeoutMs?: number;
+}
+
+export interface TaskInput {
+  goal: string;
+  context?: string;
+  conversationId?: string;
+  needs?: TaskNeed[];
+}
+
+export interface TaskCheckpointInput {
+  workerId: string;
+  kind: TaskCheckpointKind;
+  summary?: string;
+  payload?: JsonRecord;
+}
+
+export interface TaskArtifactInput {
+  name: string;
+  mimeType?: string;
+  sizeBytes: number;
+  storagePath: string;
 }
 
 export interface McpServerInput {
@@ -1747,6 +1774,312 @@ export class MemoryStore {
       error
     });
     return this.requireWorkerJob(jobId);
+  }
+
+  // ── Task lifecycle (first-class, cross-device resumable tasks) ──
+
+  createTask(input: TaskInput): Task {
+    const goal = input.goal.trim();
+    if (goal.length === 0) {
+      throw new Error("Task goal is required.");
+    }
+    const now = nowIso();
+    const task: Task = {
+      id: createId("task"),
+      goal,
+      context: input.context,
+      status: "pending",
+      conversationId: input.conversationId,
+      needs: input.needs ?? [],
+      createdAt: now,
+      updatedAt: now
+    };
+    this.db
+      .prepare(
+        `INSERT INTO tasks
+         (id, goal, context, status, conversation_id, assigned_worker_id, needs_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        task.id,
+        task.goal,
+        task.context ?? null,
+        task.status,
+        task.conversationId ?? null,
+        null,
+        stringify(task.needs),
+        task.createdAt,
+        task.updatedAt
+      );
+    this.createEvent("task.created", "Task created", { taskId: task.id, goal: task.goal }, { relatedConversationId: task.conversationId });
+    this.createAuditRecord("assistant", "task.create", "task", task.id, { goal: task.goal });
+    return task;
+  }
+
+  getTask(id: string): Task | undefined {
+    const row = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id);
+    return row ? mapTask(row) : undefined;
+  }
+
+  requireTask(id: string): Task {
+    const task = this.getTask(id);
+    if (!task) {
+      throw new Error(`Task not found: ${id}`);
+    }
+    return task;
+  }
+
+  listTasks(filter: { status?: TaskStatus; assignedWorkerId?: string } = {}): Task[] {
+    const conditions: string[] = [];
+    const params: string[] = [];
+    if (filter.status) {
+      conditions.push("status = ?");
+      params.push(filter.status);
+    }
+    if (filter.assignedWorkerId) {
+      conditions.push("assigned_worker_id = ?");
+      params.push(filter.assignedWorkerId);
+    }
+    const where = conditions.length > 0 ? ` WHERE ${conditions.join(" AND ")}` : "";
+    return this.db
+      .prepare(`SELECT * FROM tasks${where} ORDER BY created_at DESC`)
+      .all(...params)
+      .map(mapTask);
+  }
+
+  /**
+   * Capability routing: a worker claims the oldest pending task whose
+   * required needs are all satisfied by the worker's enabled capabilities.
+   * Tasks without needs are satisfied by any worker with agent.execute.
+   */
+  claimNextTask(workerId: string): Task | undefined {
+    const worker = this.requireWorker(workerId);
+    if (worker.status === "revoked") {
+      throw new Error("Worker is revoked");
+    }
+    const capabilityNames = new Set(
+      this.listWorkerCapabilities(workerId)
+        .filter((capability) => capability.enabled)
+        .map((capability) => capability.name)
+    );
+    if (!capabilityNames.has("agent.execute")) {
+      return undefined;
+    }
+    const pending = this.listTasks({ status: "pending" });
+    const matched = [...pending]
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .find((task) => taskSatisfiesNeeds(task, capabilityNames));
+    if (!matched) {
+      return undefined;
+    }
+    this.updateTaskStatusInternal(matched.id, "assigned", (task) => {
+      task.assignedWorkerId = workerId;
+    });
+    this.createWorkerEvent(workerId, undefined, "task.assigned", { taskId: matched.id });
+    this.createEvent("task.assigned", "Task assigned to worker", {
+      taskId: matched.id,
+      workerId,
+      goal: matched.goal
+    }, { relatedWorkerId: workerId });
+    this.createAuditRecord("system", "task.assign", "task", matched.id, { workerId });
+    return this.requireTask(matched.id);
+  }
+
+  markTaskRunning(workerId: string, taskId: string): Task {
+    const task = this.requireTask(taskId);
+    if (task.assignedWorkerId !== workerId) {
+      throw new Error("Task is not assigned to this worker.");
+    }
+    if (task.status !== "assigned" && task.status !== "paused") {
+      return task;
+    }
+    this.updateTaskStatusInternal(taskId, "running");
+    this.createWorkerEvent(workerId, undefined, "task.started", { taskId });
+    this.createEvent("task.started", "Task started on worker", { taskId, workerId }, { relatedWorkerId: workerId });
+    this.createAuditRecord("worker", "task.start", "task", taskId, { workerId });
+    return this.requireTask(taskId);
+  }
+
+  appendTaskCheckpoint(taskId: string, input: TaskCheckpointInput): TaskCheckpoint {
+    const task = this.requireTask(taskId);
+    if (task.assignedWorkerId !== input.workerId) {
+      throw new Error("Task is not assigned to this worker.");
+    }
+    const now = nowIso();
+    const seq = this.db
+      .prepare("SELECT COALESCE(MAX(seq), -1) + 1 AS next_seq FROM task_checkpoints WHERE task_id = ?")
+      .get(taskId) as { next_seq: number };
+    const checkpoint: TaskCheckpoint = {
+      id: createId("task_ckpt"),
+      taskId,
+      seq: Number(seq.next_seq),
+      workerId: input.workerId,
+      kind: input.kind,
+      summary: input.summary ?? "",
+      payload: input.payload ?? {},
+      createdAt: now
+    };
+    this.db
+      .prepare(
+        `INSERT INTO task_checkpoints
+         (id, task_id, seq, worker_id, kind, summary, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        checkpoint.id,
+        checkpoint.taskId,
+        checkpoint.seq,
+        checkpoint.workerId,
+        checkpoint.kind,
+        checkpoint.summary,
+        stringify(checkpoint.payload),
+        checkpoint.createdAt
+      );
+    this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(now, taskId);
+    this.createEvent("task.checkpoint", "Task progress checkpoint", {
+      taskId,
+      workerId: input.workerId,
+      seq: checkpoint.seq,
+      kind: checkpoint.kind,
+      summary: checkpoint.summary
+    }, { relatedConversationId: task.conversationId, relatedWorkerId: input.workerId });
+    return checkpoint;
+  }
+
+  listTaskCheckpoints(taskId: string): TaskCheckpoint[] {
+    return this.db
+      .prepare("SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY seq ASC")
+      .all(taskId)
+      .map(mapTaskCheckpoint);
+  }
+
+  recordTaskArtifact(taskId: string, input: TaskArtifactInput): TaskArtifact {
+    this.requireTask(taskId);
+    const now = nowIso();
+    const artifact: TaskArtifact = {
+      id: createId("task_artifact"),
+      taskId,
+      name: input.name,
+      mimeType: input.mimeType ?? "application/octet-stream",
+      sizeBytes: input.sizeBytes,
+      storagePath: input.storagePath,
+      createdAt: now
+    };
+    this.db
+      .prepare(
+        `INSERT INTO task_artifacts
+         (id, task_id, name, mime_type, size_bytes, storage_path, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(artifact.id, artifact.taskId, artifact.name, artifact.mimeType, artifact.sizeBytes, artifact.storagePath, artifact.createdAt);
+    this.createEvent("task.artifact.created", "Task artifact stored", {
+      taskId,
+      artifactId: artifact.id,
+      name: artifact.name,
+      sizeBytes: artifact.sizeBytes
+    });
+    this.createAuditRecord("worker", "task.artifact.store", "task_artifact", artifact.id, {
+      taskId,
+      name: artifact.name,
+      sizeBytes: artifact.sizeBytes
+    });
+    return artifact;
+  }
+
+  listTaskArtifacts(taskId: string): TaskArtifact[] {
+    return this.db
+      .prepare("SELECT * FROM task_artifacts WHERE task_id = ? ORDER BY created_at ASC")
+      .all(taskId)
+      .map(mapTaskArtifact);
+  }
+
+  /**
+   * Pause a running task and generate a deterministic handoff summary from
+   * its checkpoints so any capable worker can resume it later.
+   */
+  pauseTask(taskId: string): Task {
+    const task = this.requireTask(taskId);
+    if (task.status !== "running" && task.status !== "assigned" && task.status !== "pending") {
+      return task;
+    }
+    const handoffSummary = buildHandoffSummary(task, this.listTaskCheckpoints(taskId), this);
+    const now = nowIso();
+    this.db
+      .prepare("UPDATE tasks SET status = ?, handoff_summary = ?, assigned_worker_id = NULL, updated_at = ? WHERE id = ?")
+      .run("paused", handoffSummary, now, taskId);
+    this.createEvent("task.paused", "Task paused", { taskId, handoffSummary }, { relatedConversationId: task.conversationId });
+    this.createAuditRecord("owner", "task.pause", "task", taskId, { handoffSummary });
+    return this.requireTask(taskId);
+  }
+
+  resumeTask(taskId: string): Task {
+    const task = this.requireTask(taskId);
+    if (task.status !== "paused" && task.status !== "failed") {
+      return task;
+    }
+    const now = nowIso();
+    this.db
+      .prepare("UPDATE tasks SET status = ?, error = NULL, updated_at = ? WHERE id = ?")
+      .run("pending", now, taskId);
+    this.createEvent("task.resumed", "Task resumed and waiting for a worker", { taskId }, { relatedConversationId: task.conversationId });
+    this.createAuditRecord("owner", "task.resume", "task", taskId, {});
+    return this.requireTask(taskId);
+  }
+
+  completeTask(workerId: string, taskId: string, result: JsonRecord): Task {
+    const task = this.requireTask(taskId);
+    if (task.assignedWorkerId !== workerId) {
+      throw new Error("Task is not assigned to this worker.");
+    }
+    const now = nowIso();
+    this.db
+      .prepare("UPDATE tasks SET status = ?, result_json = ?, completed_at = ?, updated_at = ? WHERE id = ?")
+      .run("completed", stringify(result), now, now, taskId);
+    this.createWorkerEvent(workerId, undefined, "task.completed", { taskId });
+    this.createEvent("task.completed", "Task completed", {
+      taskId,
+      workerId,
+      summary: typeof result.summary === "string" ? result.summary : undefined
+    }, { relatedConversationId: task.conversationId, relatedWorkerId: workerId });
+    this.createAuditRecord("worker", "task.complete", "task", taskId, { workerId });
+    return this.requireTask(taskId);
+  }
+
+  failTask(workerId: string, taskId: string, error: string): Task {
+    const task = this.requireTask(taskId);
+    if (task.assignedWorkerId !== workerId) {
+      throw new Error("Task is not assigned to this worker.");
+    }
+    const now = nowIso();
+    this.db
+      .prepare("UPDATE tasks SET status = ?, error = ?, updated_at = ? WHERE id = ?")
+      .run("failed", error, now, taskId);
+    this.createWorkerEvent(workerId, undefined, "task.failed", { taskId, error });
+    this.createEvent("task.failed", "Task failed", { taskId, workerId, error }, { relatedConversationId: task.conversationId, relatedWorkerId: workerId });
+    this.createAuditRecord("worker", "task.fail", "task", taskId, { workerId, error });
+    return this.requireTask(taskId);
+  }
+
+  cancelTask(taskId: string): Task {
+    const task = this.requireTask(taskId);
+    if (task.status === "completed" || task.status === "cancelled") {
+      return task;
+    }
+    const now = nowIso();
+    this.db
+      .prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?")
+      .run("cancelled", now, taskId);
+    this.createEvent("task.cancelled", "Task cancelled", { taskId }, { relatedConversationId: task.conversationId });
+    this.createAuditRecord("owner", "task.cancel", "task", taskId, {});
+    return this.requireTask(taskId);
+  }
+
+  private updateTaskStatusInternal(taskId: string, status: TaskStatus, mutate?: (task: Task) => void): void {
+    const task = this.requireTask(taskId);
+    mutate?.(task);
+    this.db
+      .prepare("UPDATE tasks SET status = ?, assigned_worker_id = ?, updated_at = ? WHERE id = ?")
+      .run(status, task.assignedWorkerId ?? null, nowIso(), taskId);
   }
 
   listAuditRecords(): AuditRecord[] {
@@ -4117,6 +4450,76 @@ function mapWorkerJob(row: Record<string, unknown>): WorkerJob {
   };
 }
 
+function mapTask(row: Record<string, unknown>): Task {
+  return {
+    id: String(row.id),
+    goal: String(row.goal),
+    context: row.context ? String(row.context) : undefined,
+    status: row.status as TaskStatus,
+    conversationId: row.conversation_id ? String(row.conversation_id) : undefined,
+    assignedWorkerId: row.assigned_worker_id ? String(row.assigned_worker_id) : undefined,
+    needs: parseJson<TaskNeed[]>(row.needs_json, []),
+    handoffSummary: row.handoff_summary ? String(row.handoff_summary) : undefined,
+    result: row.result_json ? parseJson<JsonRecord>(row.result_json, {}) : undefined,
+    error: row.error ? String(row.error) : undefined,
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+    completedAt: row.completed_at ? String(row.completed_at) : undefined
+  };
+}
+
+function mapTaskCheckpoint(row: Record<string, unknown>): TaskCheckpoint {
+  return {
+    id: String(row.id),
+    taskId: String(row.task_id),
+    seq: Number(row.seq),
+    workerId: String(row.worker_id),
+    kind: row.kind as TaskCheckpointKind,
+    summary: String(row.summary ?? ""),
+    payload: parseJson<JsonRecord>(row.payload_json, {}),
+    createdAt: String(row.created_at)
+  };
+}
+
+function mapTaskArtifact(row: Record<string, unknown>): TaskArtifact {
+  return {
+    id: String(row.id),
+    taskId: String(row.task_id),
+    name: String(row.name),
+    mimeType: String(row.mime_type),
+    sizeBytes: Number(row.size_bytes),
+    storagePath: String(row.storage_path),
+    createdAt: String(row.created_at)
+  };
+}
+
+function taskSatisfiesNeeds(task: Task, capabilityNames: Set<string>): boolean {
+  return task.needs.every((need) => need.optional || capabilityNames.has(need.capability));
+}
+
+function buildHandoffSummary(
+  task: Task,
+  checkpoints: TaskCheckpoint[],
+  workerLookup: { getWorker(id: string): Worker | undefined }
+): string {
+  const lines: string[] = [`Goal: ${task.goal}`];
+  if (task.context) {
+    lines.push(`Context: ${task.context}`);
+  }
+  const progress = checkpoints.filter((checkpoint) => checkpoint.kind === "progress" || checkpoint.kind === "note");
+  if (progress.length > 0) {
+    lines.push("Progress so far:");
+    for (const checkpoint of progress.slice(-10)) {
+      const workerName = workerLookup.getWorker(checkpoint.workerId)?.displayName ?? checkpoint.workerId;
+      lines.push(`- [${workerName}] ${checkpoint.summary || checkpoint.kind}`);
+    }
+  } else {
+    lines.push("Progress so far: no checkpoints were reported.");
+  }
+  lines.push("Resume instructions: review the progress above, inspect existing work on disk before writing, and continue from the last completed step.");
+  return lines.join("\n");
+}
+
 function mapAuditRecord(row: Record<string, unknown>): AuditRecord {
   return {
     id: String(row.id),
@@ -4486,6 +4889,43 @@ CREATE TABLE IF NOT EXISTS worker_events (
   job_id TEXT,
   type TEXT NOT NULL,
   payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  goal TEXT NOT NULL,
+  context TEXT,
+  status TEXT NOT NULL,
+  conversation_id TEXT,
+  assigned_worker_id TEXT,
+  needs_json TEXT NOT NULL DEFAULT '[]',
+  handoff_summary TEXT,
+  result_json TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_checkpoints (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  worker_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  summary TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_artifacts (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+  size_bytes INTEGER NOT NULL,
+  storage_path TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
 

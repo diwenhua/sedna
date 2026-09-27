@@ -1,3 +1,5 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import multipart from "@fastify/multipart";
 import { z } from "zod";
@@ -173,6 +175,40 @@ const FailWorkerJobBody = z.object({
   error: z.string().min(1)
 });
 
+const CreateTaskBody = z.object({
+  goal: z.string().min(1),
+  context: z.string().optional(),
+  conversation_id: z.string().optional(),
+  needs: z.array(
+    z.object({
+      capability: z.string().min(1),
+      optional: z.boolean().default(false)
+    })
+  ).default([])
+});
+
+const TaskCheckpointBody = z.object({
+  kind: z.enum(["progress", "note", "artifact_ref"]).default("progress"),
+  summary: z.string().default(""),
+  payload: z.record(z.unknown()).default({})
+});
+
+const CompleteTaskBody = z.object({
+  result: z.record(z.unknown()).default({})
+});
+
+const FailTaskBody = z.object({
+  error: z.string().min(1)
+});
+
+const TaskArtifactUploadBody = z.object({
+  name: z.string().min(1),
+  mime_type: z.string().default("application/octet-stream"),
+  content_base64: z.string().min(1)
+});
+
+const MAX_TASK_ARTIFACT_BYTES = 5 * 1024 * 1024;
+
 const McpServerBody = z.object({
   name: z.string().min(1),
   transport: z.enum(["stdio", "streamable_http"]),
@@ -218,6 +254,18 @@ export async function buildBrainServer(options: BrainServerOptions = {}): Promis
 
   const app = Fastify({ logger: options.logger ?? false });
   await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } });
+
+  const dbPath = process.env.SEDNA_DB_PATH ?? "apps/brain/data/sedna.sqlite";
+  const artifactsDir = process.env.SEDNA_ARTIFACTS_DIR ?? path.join(path.dirname(path.resolve(dbPath)), "artifacts");
+
+  async function storeTaskArtifactFile(taskId: string, artifactId: string, name: string, content: Buffer): Promise<string> {
+    const safeName = name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
+    const taskDir = path.join(artifactsDir, taskId);
+    await mkdir(taskDir, { recursive: true });
+    const storagePath = path.join(taskDir, `${artifactId}-${safeName}`);
+    await writeFile(storagePath, content);
+    return storagePath;
+  }
 
   function requireWorkerCredential(workerId: string, request: FastifyRequest, reply: FastifyReply): boolean {
     const credential = readBearerToken(request);
@@ -703,6 +751,187 @@ export async function buildBrainServer(options: BrainServerOptions = {}): Promis
       timeoutMs: body.timeout_ms
     });
     return reply.status(201).send(job);
+  });
+
+  // ── Tasks: first-class, cross-device resumable work items ──
+
+  app.get("/api/tasks", async (request) => {
+    const query = request.query as { status?: string; assigned_worker_id?: string } | undefined;
+    const statuses = ["pending", "assigned", "running", "paused", "completed", "failed", "cancelled"];
+    const status = query?.status && statuses.includes(query.status) ? query.status as never : undefined;
+    return store.listTasks({
+      status,
+      assignedWorkerId: query?.assigned_worker_id
+    });
+  });
+
+  app.post("/api/tasks", async (request, reply) => {
+    const body = CreateTaskBody.parse(request.body ?? {});
+    try {
+      const task = store.createTask({
+        goal: body.goal,
+        context: body.context,
+        conversationId: body.conversation_id,
+        needs: body.needs
+      });
+      return reply.status(201).send(task);
+    } catch (error) {
+      return reply.status(400).send({ error: error instanceof Error ? error.message : "Task creation failed." });
+    }
+  });
+
+  app.get("/api/tasks/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const task = store.getTask(id);
+    if (!task) {
+      return reply.status(404).send({ error: "Task not found" });
+    }
+    return {
+      task,
+      checkpoints: store.listTaskCheckpoints(id),
+      artifacts: store.listTaskArtifacts(id)
+    };
+  });
+
+  app.post("/api/tasks/:id/pause", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    try {
+      return reply.send(store.pauseTask(id));
+    } catch (error) {
+      return reply.status(404).send({ error: error instanceof Error ? error.message : "Task pause failed." });
+    }
+  });
+
+  app.post("/api/tasks/:id/resume", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    try {
+      return reply.send(store.resumeTask(id));
+    } catch (error) {
+      return reply.status(404).send({ error: error instanceof Error ? error.message : "Task resume failed." });
+    }
+  });
+
+  app.post("/api/tasks/:id/cancel", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    try {
+      return reply.send(store.cancelTask(id));
+    } catch (error) {
+      return reply.status(404).send({ error: error instanceof Error ? error.message : "Task cancel failed." });
+    }
+  });
+
+  app.get("/api/tasks/:id/artifacts/:artifactId", async (request, reply) => {
+    const { id, artifactId } = request.params as { id: string; artifactId: string };
+    const artifact = store.listTaskArtifacts(id).find((item) => item.id === artifactId);
+    if (!artifact) {
+      return reply.status(404).send({ error: "Task artifact not found" });
+    }
+    try {
+      const content = await readFile(artifact.storagePath);
+      return reply.header("Content-Type", artifact.mimeType).send(content);
+    } catch {
+      return reply.status(404).send({ error: "Task artifact content is missing on disk." });
+    }
+  });
+
+  app.get("/api/workers/:id/tasks/claim", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!requireWorkerCredential(id, request, reply)) {
+      return;
+    }
+    const task = store.claimNextTask(id);
+    if (!task) {
+      return reply.status(204).send();
+    }
+    return reply.send({
+      task,
+      checkpoints: store.listTaskCheckpoints(task.id)
+    });
+  });
+
+  app.post("/api/workers/:id/tasks/:taskId/start", async (request, reply) => {
+    const { id, taskId } = request.params as { id: string; taskId: string };
+    if (!requireWorkerCredential(id, request, reply)) {
+      return;
+    }
+    try {
+      return reply.send(store.markTaskRunning(id, taskId));
+    } catch (error) {
+      return reply.status(400).send({ error: error instanceof Error ? error.message : "Task start failed." });
+    }
+  });
+
+  app.post("/api/workers/:id/tasks/:taskId/checkpoint", async (request, reply) => {
+    const { id, taskId } = request.params as { id: string; taskId: string };
+    if (!requireWorkerCredential(id, request, reply)) {
+      return;
+    }
+    const body = TaskCheckpointBody.parse(request.body ?? {});
+    try {
+      return reply.status(201).send(store.appendTaskCheckpoint(taskId, {
+        workerId: id,
+        kind: body.kind,
+        summary: body.summary,
+        payload: body.payload
+      }));
+    } catch (error) {
+      return reply.status(400).send({ error: error instanceof Error ? error.message : "Task checkpoint failed." });
+    }
+  });
+
+  app.post("/api/workers/:id/tasks/:taskId/artifacts", async (request, reply) => {
+    const { id, taskId } = request.params as { id: string; taskId: string };
+    if (!requireWorkerCredential(id, request, reply)) {
+      return;
+    }
+    const body = TaskArtifactUploadBody.parse(request.body ?? {});
+    const content = Buffer.from(body.content_base64, "base64");
+    if (content.byteLength > MAX_TASK_ARTIFACT_BYTES) {
+      return reply.status(413).send({ error: "Task artifact exceeds 5MB limit." });
+    }
+    try {
+      const task = store.getTask(taskId);
+      if (!task) {
+        return reply.status(404).send({ error: "Task not found" });
+      }
+      const provisionalId = `task_artifact_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      const storagePath = await storeTaskArtifactFile(taskId, provisionalId, body.name, content);
+      const artifact = store.recordTaskArtifact(taskId, {
+        name: body.name,
+        mimeType: body.mime_type,
+        sizeBytes: content.byteLength,
+        storagePath
+      });
+      return reply.status(201).send(artifact);
+    } catch (error) {
+      return reply.status(400).send({ error: error instanceof Error ? error.message : "Task artifact upload failed." });
+    }
+  });
+
+  app.post("/api/workers/:id/tasks/:taskId/complete", async (request, reply) => {
+    const { id, taskId } = request.params as { id: string; taskId: string };
+    if (!requireWorkerCredential(id, request, reply)) {
+      return;
+    }
+    const body = CompleteTaskBody.parse(request.body ?? {});
+    try {
+      return reply.send(store.completeTask(id, taskId, body.result));
+    } catch (error) {
+      return reply.status(400).send({ error: error instanceof Error ? error.message : "Task complete failed." });
+    }
+  });
+
+  app.post("/api/workers/:id/tasks/:taskId/fail", async (request, reply) => {
+    const { id, taskId } = request.params as { id: string; taskId: string };
+    if (!requireWorkerCredential(id, request, reply)) {
+      return;
+    }
+    const body = FailTaskBody.parse(request.body ?? {});
+    try {
+      return reply.send(store.failTask(id, taskId, body.error));
+    } catch (error) {
+      return reply.status(400).send({ error: error instanceof Error ? error.message : "Task fail report failed." });
+    }
   });
 
   app.post("/api/workers/register-mock", async (request, reply) => {

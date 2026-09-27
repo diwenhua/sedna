@@ -17,6 +17,166 @@ export interface WorkerToolProgress {
   url?: string;
 }
 
+export function buildTaskManagementToolDefinitions(): FunctionToolDefinition[] {
+  return [
+    {
+      type: "function",
+      name: "task_create",
+      description: "Create a persistent, cross-device task. The task is stored centrally in the Brain, queued as pending, and the next capable worker device (office laptop, home server, etc.) claims and executes it automatically. Progress is checkpointed so the task can pause on one device and resume on another. Use this instead of worker_dispatch_task for long-running work or work that should follow the owner across devices.",
+      parameters: {
+        type: "object",
+        properties: {
+          goal: { type: "string", description: "What the task should accomplish. Device-independent; do not reference local paths unless you pass them via context." },
+          context: { type: "string", description: "Optional extra context, constraints, or handoff notes for the executing worker." },
+          needs: {
+            type: "array",
+            description: "Optional capability requirements. Each entry names a worker capability (e.g. agent.execute) that must be satisfied by the claiming worker.",
+            items: {
+              type: "object",
+              properties: {
+                capability: { type: "string" },
+                optional: { type: "boolean" }
+              },
+              required: ["capability"],
+              additionalProperties: false
+            }
+          }
+        },
+        required: ["goal"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "task_status",
+      description: "Check the status, progress checkpoints, and artifacts of a persistent task. Omit task_id to list recent tasks.",
+      parameters: {
+        type: "object",
+        properties: {
+          task_id: { type: "string", description: "Optional task id returned by task_create." }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "task_pause",
+      description: "Pause a running or pending task. Generates a handoff summary from its checkpoints so any capable device can resume it later with full context.",
+      parameters: {
+        type: "object",
+        properties: {
+          task_id: { type: "string" }
+        },
+        required: ["task_id"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "task_resume",
+      description: "Resume a paused or failed task. It is re-queued as pending and will be claimed by the next capable worker device, which continues from the last checkpoint.",
+      parameters: {
+        type: "object",
+        properties: {
+          task_id: { type: "string" }
+        },
+        required: ["task_id"],
+        additionalProperties: false
+      }
+    }
+  ];
+}
+
+export async function executeTaskManagementTool(
+  store: MemoryStore,
+  toolName: string,
+  args: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  if (toolName === "task_create") {
+    const goal = typeof args.goal === "string" ? args.goal.trim() : "";
+    if (goal.length === 0) {
+      return { success: false, error: "task_create requires goal." };
+    }
+    const needs = Array.isArray(args.needs)
+      ? args.needs
+        .filter((item): item is { capability: string; optional?: boolean } =>
+          typeof item === "object" && item !== null && typeof (item as { capability?: unknown }).capability === "string")
+        .map((item) => ({ capability: item.capability, optional: item.optional === true }))
+      : [];
+    const task = store.createTask({
+      goal,
+      context: typeof args.context === "string" ? args.context : undefined,
+      needs
+    });
+    return {
+      success: true,
+      task_id: task.id,
+      status: task.status,
+      note: "Task queued. The next capable worker device will claim it automatically. Use task_status to track progress."
+    };
+  }
+
+  if (toolName === "task_status") {
+    const taskId = typeof args.task_id === "string" ? args.task_id.trim() : "";
+    if (taskId) {
+      const task = store.getTask(taskId);
+      if (!task) {
+        return { success: false, error: `Task not found: ${taskId}` };
+      }
+      const checkpoints = store.listTaskCheckpoints(taskId);
+      return {
+        success: true,
+        task,
+        checkpoint_count: checkpoints.length,
+        recent_checkpoints: checkpoints.slice(-5).map((checkpoint) => `${checkpoint.summary || checkpoint.kind}`),
+        artifacts: store.listTaskArtifacts(taskId).map((artifact) => ({ id: artifact.id, name: artifact.name, sizeBytes: artifact.sizeBytes }))
+      };
+    }
+    const tasks = store.listTasks().slice(0, 10);
+    return {
+      success: true,
+      tasks: tasks.map((task) => ({
+        task_id: task.id,
+        goal: task.goal,
+        status: task.status,
+        assigned_worker_id: task.assignedWorkerId
+      }))
+    };
+  }
+
+  if (toolName === "task_pause") {
+    const taskId = typeof args.task_id === "string" ? args.task_id.trim() : "";
+    if (!taskId) {
+      return { success: false, error: "task_pause requires task_id." };
+    }
+    const task = store.pauseTask(taskId);
+    return { success: true, task_id: task.id, status: task.status, handoff_summary: task.handoffSummary };
+  }
+
+  if (toolName === "task_resume") {
+    const taskId = typeof args.task_id === "string" ? args.task_id.trim() : "";
+    if (!taskId) {
+      return { success: false, error: "task_resume requires task_id." };
+    }
+    const task = store.resumeTask(taskId);
+    return { success: true, task_id: task.id, status: task.status, note: "Task re-queued; the next capable worker will claim it and resume from the last checkpoint." };
+  }
+
+  return { success: false, error: `Unsupported task tool: ${toolName}` };
+}
+
+export function summarizeTaskManagementTool(observation: Record<string, unknown>): string {
+  if (observation.success === false) {
+    return typeof observation.error === "string" ? observation.error : "Task tool failed.";
+  }
+  const status = typeof observation.status === "string" ? observation.status : "";
+  if (typeof observation.task_id === "string") {
+    return `Task ${observation.task_id}${status ? ` ${status}` : ""}`;
+  }
+  const count = Array.isArray(observation.tasks) ? observation.tasks.length : 0;
+  return `${count} task${count === 1 ? "" : "s"}`;
+}
+
 export function buildWorkerAgentToolDefinitions(store: MemoryStore): FunctionToolDefinition[] {
   const workers = listDispatchableWorkers(store);
   if (workers.length === 0) {

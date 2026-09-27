@@ -3,7 +3,7 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { executeWorkerCapability, parseAllowedPaths, type WorkerRuntimePolicy } from "./capabilities.js";
-import type { WorkerAgentLlmConfig } from "./agent-loop.js";
+import { runWorkerAgentTask, type WorkerAgentLlmConfig } from "./agent-loop.js";
 
 interface WorkerState {
   workerId?: string;
@@ -16,6 +16,29 @@ interface WorkerJob {
   input: Record<string, unknown>;
   timeoutMs: number;
 }
+
+interface WorkerTask {
+  id: string;
+  goal: string;
+  context?: string;
+  status: string;
+  handoffSummary?: string;
+  needs?: Array<{ capability: string; optional: boolean }>;
+}
+
+interface WorkerTaskCheckpoint {
+  id: string;
+  seq: number;
+  kind: string;
+  summary: string;
+}
+
+interface ClaimedTask {
+  task: WorkerTask;
+  checkpoints: WorkerTaskCheckpoint[];
+}
+
+const runningTaskIds = new Set<string>();
 
 interface WorkerPathScopePolicy {
   id: string;
@@ -149,6 +172,110 @@ async function pollOnce(workerId: string, credential: string): Promise<void> {
   for (const job of jobs) {
     await runJob(workerId, credential, job);
   }
+  await claimAndRunTask(workerId, credential);
+}
+
+async function claimAndRunTask(workerId: string, credential: string): Promise<void> {
+  const claimed = await api<ClaimedTask | undefined>(`/api/workers/${encodeURIComponent(workerId)}/tasks/claim`, { credential });
+  if (!claimed?.task) {
+    return;
+  }
+  const task = claimed.task;
+  if (runningTaskIds.has(task.id)) {
+    return;
+  }
+  runningTaskIds.add(task.id);
+  void runClaimedTask(workerId, credential, claimed)
+    .catch(logError)
+    .finally(() => runningTaskIds.delete(task.id));
+}
+
+async function runClaimedTask(workerId: string, credential: string, claimed: ClaimedTask): Promise<void> {
+  const task = claimed.task;
+  const taskApi = (pathname: string, init: RequestInit = {}) =>
+    api(`/api/workers/${encodeURIComponent(workerId)}/tasks/${encodeURIComponent(task.id)}${pathname}`, {
+      credential,
+      ...init
+    });
+
+  await taskApi("/start", { method: "POST" });
+
+  // Build resume context: handoff summary (paused earlier) + recent checkpoints.
+  const resumeParts: string[] = [];
+  if (task.handoffSummary?.trim()) {
+    resumeParts.push(`This task was previously paused. Handoff summary:\n${task.handoffSummary.trim()}`);
+  }
+  if (claimed.checkpoints.length > 0) {
+    const recent = claimed.checkpoints.slice(-10);
+    resumeParts.push(`Previous checkpoints:\n${recent.map((cp) => `- ${cp.summary || cp.kind}`).join("\n")}`);
+  }
+
+  const timeoutMs = intEnv("SEDNA_WORKER_TASK_TIMEOUT_MS", 600_000);
+  try {
+    const llm = await fetchAgentLlm(workerId, credential);
+    const result = await withTimeout(
+      runWorkerAgentTask({
+        goal: task.goal,
+        context: [task.context?.trim(), ...resumeParts].filter(Boolean).join("\n\n") || undefined,
+        policy: runtimePolicy(),
+        llm,
+        fetchImpl: fetch,
+        onStep: async (event) => {
+          await reportTaskCheckpoint(taskApi, {
+            kind: "progress",
+            summary: `${event.tool}: ${event.summary}`,
+            payload: { tool: event.tool, args: event.args, success: event.observation.success !== false }
+          }).catch(logError);
+          if (event.tool === "file_write" && event.observation.success !== false && typeof event.args.path === "string") {
+            await uploadTaskArtifact(taskApi, event.args.path).catch(logError);
+          }
+        }
+      }),
+      timeoutMs
+    );
+    await taskApi("/complete", { method: "POST", body: JSON.stringify({ result }) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await reportTaskCheckpoint(taskApi, {
+      kind: "note",
+      summary: `Task interrupted: ${message}`
+    }).catch(logError);
+    await taskApi("/fail", { method: "POST", body: JSON.stringify({ error: message }) });
+  }
+}
+
+async function reportTaskCheckpoint(
+  taskApi: (pathname: string, init?: RequestInit) => Promise<unknown>,
+  body: { kind: string; summary: string; payload?: Record<string, unknown> }
+): Promise<void> {
+  await taskApi("/checkpoint", {
+    method: "POST",
+    body: JSON.stringify({
+      kind: body.kind,
+      summary: body.summary,
+      payload: body.payload ?? {}
+    })
+  });
+}
+
+const MAX_ARTIFACT_UPLOAD_BYTES = 5 * 1024 * 1024;
+
+async function uploadTaskArtifact(
+  taskApi: (pathname: string, init?: RequestInit) => Promise<unknown>,
+  filePath: string
+): Promise<void> {
+  const content = await readFile(filePath);
+  if (content.byteLength === 0 || content.byteLength > MAX_ARTIFACT_UPLOAD_BYTES) {
+    return;
+  }
+  await taskApi("/artifacts", {
+    method: "POST",
+    body: JSON.stringify({
+      name: path.basename(filePath),
+      mime_type: "application/octet-stream",
+      content_base64: content.toString("base64")
+    })
+  });
 }
 
 async function runJob(workerId: string, credential: string, job: WorkerJob): Promise<void> {
@@ -250,6 +377,9 @@ async function api<T = unknown>(pathname: string, init: RequestInit & { credenti
   });
   if (!response.ok) {
     throw new Error(`Brain API request failed: ${response.status} ${await response.text()}`);
+  }
+  if (response.status === 204) {
+    return undefined as T;
   }
   return response.json() as Promise<T>;
 }

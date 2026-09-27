@@ -221,6 +221,16 @@ export const EventTypeSchema = z.enum([
   "worker.job.started",
   "worker.job.completed",
   "worker.job.failed",
+  "task.created",
+  "task.assigned",
+  "task.started",
+  "task.checkpoint",
+  "task.paused",
+  "task.resumed",
+  "task.completed",
+  "task.failed",
+  "task.cancelled",
+  "task.artifact.created",
   "settings.updated",
   "web.tools.updated",
   "llm.provider.created",
@@ -499,7 +509,6 @@ export type WorkerPathScopeMode = z.infer<typeof WorkerPathScopeModeSchema>;
 
 export const WorkerJobStatusSchema = z.enum(["queued", "running", "completed", "failed", "cancelled"]);
 export type WorkerJobStatus = z.infer<typeof WorkerJobStatusSchema>;
-
 export const WorkerSchema = z.object({
   id: z.string().min(1),
   displayName: z.string().min(1),
@@ -567,6 +576,66 @@ export const WorkerEventSchema = z.object({
   createdAt: IsoDateStringSchema
 });
 export type WorkerEvent = z.infer<typeof WorkerEventSchema>;
+
+export const TaskStatusSchema = z.enum([
+  "pending",
+  "assigned",
+  "running",
+  "paused",
+  "completed",
+  "failed",
+  "cancelled"
+]);
+export type TaskStatus = z.infer<typeof TaskStatusSchema>;
+
+export const TaskNeedSchema = z.object({
+  capability: z.string().min(1),
+  optional: z.boolean().default(false)
+});
+export type TaskNeed = z.infer<typeof TaskNeedSchema>;
+
+export const TaskSchema = z.object({
+  id: z.string().min(1),
+  goal: z.string().min(1),
+  context: z.string().optional(),
+  status: TaskStatusSchema,
+  conversationId: z.string().optional(),
+  assignedWorkerId: z.string().optional(),
+  needs: z.array(TaskNeedSchema).default([]),
+  handoffSummary: z.string().optional(),
+  result: z.record(z.unknown()).optional(),
+  error: z.string().optional(),
+  createdAt: IsoDateStringSchema,
+  updatedAt: IsoDateStringSchema,
+  completedAt: IsoDateStringSchema.optional()
+});
+export type Task = z.infer<typeof TaskSchema>;
+
+export const TaskCheckpointKindSchema = z.enum(["progress", "note", "artifact_ref"]);
+export type TaskCheckpointKind = z.infer<typeof TaskCheckpointKindSchema>;
+
+export const TaskCheckpointSchema = z.object({
+  id: z.string().min(1),
+  taskId: z.string().min(1),
+  seq: z.number().int().nonnegative(),
+  workerId: z.string().min(1),
+  kind: TaskCheckpointKindSchema,
+  summary: z.string().default(""),
+  payload: z.record(z.unknown()).default({}),
+  createdAt: IsoDateStringSchema
+});
+export type TaskCheckpoint = z.infer<typeof TaskCheckpointSchema>;
+
+export const TaskArtifactSchema = z.object({
+  id: z.string().min(1),
+  taskId: z.string().min(1),
+  name: z.string().min(1),
+  mimeType: z.string().default("application/octet-stream"),
+  sizeBytes: z.number().int().nonnegative(),
+  storagePath: z.string().min(1),
+  createdAt: IsoDateStringSchema
+});
+export type TaskArtifact = z.infer<typeof TaskArtifactSchema>;
 
 export const GraphResponseSchema = z.object({
   nodes: z.array(GraphNodeSchema),

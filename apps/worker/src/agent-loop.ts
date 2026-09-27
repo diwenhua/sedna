@@ -104,6 +104,13 @@ const LOCAL_TOOL_DEFINITIONS: LocalToolDefinition[] = [
   }
 ];
 
+export interface WorkerAgentStepEvent {
+  tool: string;
+  args: Record<string, unknown>;
+  observation: Record<string, unknown>;
+  summary: string;
+}
+
 export async function runWorkerAgentTask(input: {
   goal: string;
   context?: string;
@@ -111,6 +118,7 @@ export async function runWorkerAgentTask(input: {
   llm: WorkerAgentLlmConfig;
   fetchImpl?: typeof fetch;
   maxRounds?: number;
+  onStep?: (event: WorkerAgentStepEvent) => void | Promise<void>;
 }): Promise<Record<string, unknown>> {
   if (input.llm.adapterType === "gemini") {
     return { success: false, error: "Worker agent does not support Gemini adapter yet. Use openai-native, openai-compatible, or anthropic for chat_reply." };
@@ -158,8 +166,12 @@ export async function runWorkerAgentTask(input: {
     for (const toolCall of toolCalls) {
       const args = parseToolArguments(toolCall.arguments);
       const observation = await executeLocalTool(toolCall.name, args, input.policy);
-      steps.push({ tool: toolCall.name, summary: summarizeLocalTool(toolCall.name, observation) });
+      const summary = summarizeLocalTool(toolCall.name, observation);
+      steps.push({ tool: toolCall.name, summary });
       toolResults.push({ toolCall, observation });
+      if (input.onStep) {
+        await input.onStep({ tool: toolCall.name, args, observation, summary });
+      }
     }
     transcript = appendToolOutputs(input.llm.adapterType, transcript, toolResults);
   }

@@ -8,8 +8,11 @@ import { McpClient } from "../mcp/client.js";
 import { executeTool } from "../tools/tool-executor.js";
 import { readOwnerProfile, searchActiveMemories } from "./agent-context-tools.js";
 import {
+  buildTaskManagementToolDefinitions,
   buildWorkerAgentToolDefinitions,
+  executeTaskManagementTool,
   executeWorkerDispatchTask,
+  summarizeTaskManagementTool,
   summarizeWorkerDispatchTask
 } from "./agent-worker-tools.js";
 import { executeInternalTool } from "../tools/internal-tools.js";
@@ -154,6 +157,14 @@ function buildAgentToolDefinitions(store: MemoryStore, input: LlmConversationInp
       tools.push(tool);
       reserved.add(tool.name);
     }
+  }
+
+  for (const tool of buildTaskManagementToolDefinitions()) {
+    if (reserved.has(tool.name)) {
+      continue;
+    }
+    tools.push(tool);
+    reserved.add(tool.name);
   }
 
   for (const tool of buildWorkerAgentToolDefinitions(store)) {
@@ -789,6 +800,9 @@ async function executeAgentTool(
       max_chars: args.max_chars
     }, fetchImpl);
   }
+  if (toolCall.name === "task_create" || toolCall.name === "task_status" || toolCall.name === "task_pause" || toolCall.name === "task_resume") {
+    return executeTaskManagementTool(store, toolCall.name, args);
+  }
   if (toolCall.name === "worker_dispatch_task") {
     return executeWorkerDispatchTask(store, args, {
       onProgress: async (event) => {
@@ -860,6 +874,9 @@ function summarizeObservation(toolName: string, observation: Record<string, unkn
   }
   if (toolName === "worker_dispatch_task") {
     return summarizeWorkerDispatchTask(observation);
+  }
+  if (toolName === "task_create" || toolName === "task_status" || toolName === "task_pause" || toolName === "task_resume") {
+    return summarizeTaskManagementTool(observation);
   }
   if (typeof observation.text === "string" && observation.text.length > 0) {
     return `${observation.text.length} characters returned`;
